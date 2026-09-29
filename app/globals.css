@@ -215,41 +215,6 @@ form {
   gap: 12px;
 }
 
-.identity {
-  display: grid;
-  gap: 14px;
-  margin-bottom: 24px;
-}
-
-.identity dt {
-  font-size: 12px;
-  font-weight: 600;
-  color: var(--muted);
-  text-transform: uppercase;
-  letter-spacing: 0.04em;
-}
-
-.identity dd {
-  margin: 4px 0 0;
-}
-
-.peer-id {
-  display: flex;
-  gap: 8px;
-  align-items: center;
-  font-family: var(--mono);
-  font-size: 12.5px;
-  background: var(--surface-2);
-  border: 1px solid var(--border);
-  border-radius: 8px;
-  padding: 8px 10px;
-  word-break: break-all;
-}
-
-.peer-id button {
-  flex-shrink: 0;
-}
-
 .muted-foot {
   margin-top: 20px;
   text-align: center;
