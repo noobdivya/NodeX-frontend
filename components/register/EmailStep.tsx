@@ -1,14 +1,14 @@
 "use client";
 
 import { useState } from "react";
-import { api, ApiError } from "@/lib/api";
+import { api, ApiError, type OtpSent } from "@/lib/api";
 
 export default function EmailStep({
   notice,
   onSent,
 }: {
   notice?: string;
-  onSent: (email: string, resendIn: number) => void;
+  onSent: (email: string, sent: OtpSent) => void;
 }) {
   const [email, setEmail] = useState("");
   const [error, setError] = useState<string | null>(null);
@@ -20,12 +20,10 @@ export default function EmailStep({
     setError(null);
     setLoading(true);
     try {
-      const res = await api.requestOtp(value);
-      onSent(value, res.resend_in_seconds);
+      onSent(value, await api.sendOtp(value));
     } catch (err) {
-      // A code was sent moments ago; let the user enter it rather than block them.
       if (err instanceof ApiError && err.code === "otp_cooldown") {
-        onSent(value, err.retryAfter ?? 60);
+        setError(`A code was just sent. You can request another in ${err.retryAfter ?? 60} seconds.`);
         return;
       }
       setError(err instanceof ApiError ? err.message : "Something went wrong. Please try again.");
@@ -36,7 +34,7 @@ export default function EmailStep({
 
   return (
     <>
-      <h1>Create your account</h1>
+      <h1>Create your NodeX identity</h1>
       <p className="lead">We&apos;ll send a 6-digit code to verify your email.</p>
 
       <form onSubmit={submit} noValidate>

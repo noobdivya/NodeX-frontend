@@ -1,17 +1,20 @@
 "use client";
 
 import { useEffect, useState } from "react";
-import { api, ApiError } from "@/lib/api";
+import { ApiError, type OtpSent } from "@/lib/api";
 
 export default function OtpStep({
   email,
   initialResendIn,
-  onVerified,
+  verify,
+  resend: resendCode,
   onChangeEmail,
 }: {
   email: string;
   initialResendIn: number;
-  onVerified: (registrationToken: string) => void;
+  /** Verifies the code and moves the flow on; throws ApiError on failure. */
+  verify: (otp: string) => Promise<void>;
+  resend: () => Promise<OtpSent>;
   onChangeEmail: () => void;
 }) {
   const [otp, setOtp] = useState("");
@@ -33,8 +36,7 @@ export default function OtpStep({
     setInfo(null);
     setLoading(true);
     try {
-      const res = await api.verifyOtp(email, otp);
-      onVerified(res.registration_token);
+      await verify(otp);
     } catch (err) {
       setError(err instanceof ApiError ? err.message : "Something went wrong. Please try again.");
       setOtp("");
@@ -48,7 +50,7 @@ export default function OtpStep({
     setInfo(null);
     setResending(true);
     try {
-      const res = await api.requestOtp(email);
+      const res = await resendCode();
       setResendIn(res.resend_in_seconds);
       setInfo("A new code is on its way.");
     } catch (err) {

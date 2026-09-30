@@ -1,3 +1,7 @@
+// The only network calls NodeX makes to a server: the stateless email
+// verifier used during registration (send code, check code). It stores
+// nothing; identities, contacts, chat and profiles never go to a server.
+
 const API_URL = (process.env.NEXT_PUBLIC_API_URL ?? "http://localhost:8080").replace(/\/$/, "");
 
 export class ApiError extends Error {
@@ -11,15 +15,16 @@ export class ApiError extends Error {
   }
 }
 
-async function request<T>(path: string, init?: RequestInit): Promise<T> {
+async function post<T>(path: string, data: unknown): Promise<T> {
   let res: Response;
   try {
     res = await fetch(`${API_URL}${path}`, {
-      ...init,
-      headers: { "Content-Type": "application/json", ...init?.headers },
+      method: "POST",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify(data),
     });
   } catch {
-    throw new ApiError(0, "network_error", "Can't reach the NodeX server. Check your connection and try again.");
+    throw new ApiError(0, "network_error", "Can't reach the NodeX email verifier. Check your connection and try again.");
   }
 
   const body = await res.json().catch(() => null);
@@ -35,38 +40,11 @@ async function request<T>(path: string, init?: RequestInit): Promise<T> {
   return body as T;
 }
 
-const post = <T>(path: string, data: unknown) => request<T>(path, { method: "POST", body: JSON.stringify(data) });
-
-export type RegisteredUser = {
-  id: string;
-  email: string;
-  username: string;
-  peer_id: string;
-  created_at: string;
-};
+export type OtpSent = { otp_token: string; expires_in_seconds: number; resend_in_seconds: number };
 
 export const api = {
-  requestOtp: (email: string) =>
-    post<{ message: string; expires_in_seconds: number; resend_in_seconds: number }>("/api/v1/auth/register/otp", {
-      email,
-    }),
+  sendOtp: (email: string) => post<OtpSent>("/api/v1/otp/send", { email }),
 
-  verifyOtp: (email: string, otp: string) =>
-    post<{ registration_token: string; expires_at: string }>("/api/v1/auth/register/verify", { email, otp }),
-
-  usernameAvailable: (username: string, signal?: AbortSignal) =>
-    request<{ username: string; available: boolean }>(
-      `/api/v1/users/username-available?username=${encodeURIComponent(username)}`,
-      { signal },
-    ),
-
-  completeRegistration: (data: {
-    registration_token: string;
-    username: string;
-    password: string;
-    confirm_password: string;
-    peer_id: string;
-    public_key: string;
-    signature: string;
-  }) => post<{ user: RegisteredUser }>("/api/v1/auth/register/complete", data),
+  verifyOtp: (otpToken: string, otp: string) =>
+    post<{ verified: true }>("/api/v1/otp/verify", { otp_token: otpToken, otp }),
 };
