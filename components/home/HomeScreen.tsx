@@ -2,12 +2,42 @@
 
 import { useRouter } from "next/navigation";
 import { useCallback, useEffect, useRef, useState } from "react";
-import { listContacts, type Contact } from "@/lib/contacts";
+import { addContact, listContacts, removeContact, type Contact } from "@/lib/contacts";
 import { clearIdentity, getIdentity, type StoredIdentity } from "@/lib/keystore";
+import { listConversations, type ConversationSummary } from "@/lib/messages";
+import type { LookupResult, NetworkStatus } from "@/lib/p2p/node";
 import { getAvatar } from "@/lib/profile";
 import Avatar from "./Avatar";
+import ChatScreen from "./ChatScreen";
+import ContactSearch from "./ContactSearch";
 import ProfileScreen from "./ProfileScreen";
-import { MoreIcon } from "./icons";
+import { MessageTick } from "./ChatScreen";
+import { MoreIcon, PlusMessageIcon } from "./icons";
+
+const PURGE_INTERVAL_MS = 60_000;
+
+/** WhatsApp-style time for the chat list: time today, "Yesterday", else date. */
+function listTime(ms: number): string {
+  const d = new Date(ms);
+  if (d.toDateString() === new Date().toDateString()) {
+    return d.toLocaleTimeString(undefined, { hour: "2-digit", minute: "2-digit" });
+  }
+  if (d.toDateString() === new Date(Date.now() - 86_400_000).toDateString()) return "Yesterday";
+  return d.toLocaleDateString(undefined, { day: "numeric", month: "short" });
+}
+
+function networkLabel(s: NetworkStatus): string {
+  switch (s.state) {
+    case "online":
+      return s.published ? "Online · discoverable on the NodeX network" : "Online · publishing your handle…";
+    case "unconfigured":
+      return "No NodeX network nodes configured";
+    case "offline":
+      return "Offline · can't reach the NodeX network";
+    default:
+      return "Connecting to the NodeX network…";
+  }
+}
 
 function addedLabel(iso: string): string {
   const days = Math.floor((Date.now() - new Date(iso).getTime()) / 86_400_000);
@@ -36,26 +66,86 @@ export default function HomeScreen() {
   const [identity, setIdentity] = useState<StoredIdentity | null>(null);
   const [avatar, setAvatar] = useState<Blob>();
   const [contacts, setContacts] = useState<Contact[]>([]);
-  const [view, setView] = useState<"contacts" | "profile">("contacts");
+  const [view, setView] = useState<"contacts" | "profile" | "search" | "chat">("contacts");
+  const [chatWith, setChatWith] = useState<Contact | null>(null);
+  const [summaries, setSummaries] = useState<Map<string, ConversationSummary>>(new Map());
+  const [loadError, setLoadError] = useState<string | null>(null);
+  const [network, setNetwork] = useState<NetworkStatus>({ state: "starting", peers: 0, published: false });
   const [menuOpen, setMenuOpen] = useState(false);
   const [confirmLogout, setConfirmLogout] = useState(false);
   const menuRef = useRef<HTMLDivElement>(null);
   const avatarUrl = useObjectUrl(avatar);
 
-  // Logged in means an identity exists on this device.
+  // Logged in means an identity exists on this device. Only a missing
+  // identity sends the user to /login; other load failures are shown here
+  // (redirecting on them would loop, since /login sends logged-in users back).
   useEffect(() => {
-    getIdentity()
-      .then(async (record) => {
-        if (!record) {
-          router.replace("/login");
-          return;
-        }
-        setIdentity(record);
+    let alive = true;
+    (async () => {
+      let record: StoredIdentity | undefined;
+      try {
+        record = await getIdentity();
+      } catch (err) {
+        if (alive) setLoadError(err instanceof Error ? err.message : String(err));
+        return;
+      }
+      if (!alive) return;
+      if (!record) {
+        router.replace("/login");
+        return;
+      }
+      setIdentity(record);
+      try {
         setAvatar(await getAvatar(record.peerId));
         setContacts(await listContacts(record.peerId));
-      })
-      .catch(() => router.replace("/login"));
+        setSummaries(await listConversations(record.peerId));
+      } catch (err) {
+        console.error("NodeX: couldn't load local data", err);
+        if (alive) setLoadError(err instanceof Error ? err.message : String(err));
+      }
+    })();
+    return () => {
+      alive = false;
+    };
   }, [router]);
+
+  const refreshChats = useCallback(async () => {
+    if (!identity) return;
+    try {
+      setContacts(await listContacts(identity.peerId));
+      setSummaries(await listConversations(identity.peerId));
+    } catch (err) {
+      console.error("NodeX: couldn't refresh chats", err);
+    }
+  }, [identity]);
+
+  // Join the P2P network (chat handler included) and publish this user's handle.
+  useEffect(() => {
+    if (!identity) return;
+    let unsubscribeStatus: (() => void) | undefined;
+    let unsubscribeChat: (() => void) | undefined;
+    let purgeTimer: ReturnType<typeof setInterval> | undefined;
+    let cancelled = false;
+    // Load chat first: it registers its protocol handler for when the node starts.
+    Promise.all([import("@/lib/p2p/chat"), import("@/lib/p2p/node")]).then(([chat, { onStatus, startNetwork }]) => {
+      if (cancelled) return;
+      unsubscribeStatus = onStatus(setNetwork);
+      unsubscribeChat = chat.onChatEvent((e) => {
+        if (e.type !== "presence") void refreshChats();
+      });
+      // Disappearing messages: delete anything read more than 48 hours ago.
+      const purge = () => void chat.purgeExpired(identity).catch(() => {});
+      purge();
+      purgeTimer = setInterval(purge, PURGE_INTERVAL_MS);
+      startNetwork(identity).catch(() => {});
+    });
+    return () => {
+      cancelled = true;
+      clearInterval(purgeTimer);
+      unsubscribeStatus?.();
+      unsubscribeChat?.();
+    };
+  }, [identity, refreshChats]);
 
   // Close the menu on outside click or Escape.
   useEffect(() => {
@@ -73,14 +163,81 @@ export default function HomeScreen() {
   }, [menuOpen]);
 
   const logout = useCallback(async () => {
+    await import("@/lib/p2p/node").then(({ stopNetwork }) => stopNetwork()).catch(() => {});
     await clearIdentity();
     router.replace("/login");
   }, [router]);
 
+  async function add(result: LookupResult) {
+    if (!identity) return;
+    await addContact(identity.peerId, { peerId: result.peerId, handle: result.handle });
+    setContacts(await listContacts(identity.peerId));
+  }
+
+  /** From a search result straight into the chat; the person is saved as a contact. */
+  async function openChatFromSearch(result: LookupResult) {
+    if (!identity) return;
+    let contact = (await listContacts(identity.peerId)).find((c) => c.peerId === result.peerId);
+    if (!contact) {
+      await addContact(identity.peerId, { peerId: result.peerId, handle: result.handle });
+      contact = (await listContacts(identity.peerId)).find((c) => c.peerId === result.peerId);
+    }
+    if (!contact) return;
+    setContacts(await listContacts(identity.peerId));
+    setChatWith(contact);
+    setView("chat");
+  }
+
+  async function remove(peerId: string) {
+    if (!identity) return;
+    await removeContact(identity.peerId, peerId);
+    setContacts(await listContacts(identity.peerId));
+  }
+
   if (!identity) {
     return (
       <div className="app">
-        <p className="app-empty">Loading…</p>
+        {loadError ? (
+          <div className="app-empty" role="alert">
+            <p>Couldn&apos;t open NodeX&apos;s storage on this device</p>
+            <span>{loadError}</span>
+          </div>
+        ) : (
+          <p className="app-empty">Loading…</p>
+        )}
+      </div>
+    );
+  }
+
+  if (view === "chat" && chatWith) {
+    return (
+      <div className="app app-chat">
+        <ChatScreen
+          identity={identity}
+          contact={chatWith}
+          network={network}
+          onBack={() => {
+            setView("contacts");
+            setChatWith(null);
+            void refreshChats();
+          }}
+        />
+      </div>
+    );
+  }
+
+  if (view === "search") {
+    return (
+      <div className="app">
+        <ContactSearch
+          identity={identity}
+          network={network}
+          savedPeerIds={new Set(contacts.map((c) => c.peerId))}
+          onAdd={add}
+          onRemove={remove}
+          onMessage={(result) => void openChatFromSearch(result)}
+          onBack={() => setView("contacts")}
+        />
       </div>
     );
   }
@@ -151,26 +308,78 @@ export default function HomeScreen() {
 
       <h1 className="sr-only">NodeX, logged in as {identity.handle}</h1>
 
+      <p className="net-status" data-state={network.state} role="status" aria-live="polite">
+        <span className="net-dot" aria-hidden="true" />
+        {networkLabel(network)}
+      </p>
+      {loadError && (
+        <p className="search-hint" data-tone="error" role="alert">
+          Some local data couldn&apos;t be loaded: {loadError}
+        </p>
+      )}
+
       {contacts.length === 0 ? (
         <div className="app-empty">
           <p>No contacts yet</p>
-          <span>
-            You&apos;ll find people by their handle, like Rahul#7K3M9X, directly over the NodeX peer-to-peer network.
-          </span>
+          <span>Tap the + button to find people by their handle, like Rahul#7K3M9X.</span>
         </div>
       ) : (
         <ul className="chat-list" aria-label="Contacts">
-          {contacts.map((c) => (
-            <li key={c.peerId} className="chat-row">
-              <Avatar name={c.handle} />
-              <div className="chat-main">
-                <span className="chat-name">{c.handle}</span>
-                <span className="chat-sub">{addedLabel(c.addedAt)}</span>
-              </div>
-            </li>
-          ))}
+          {[...contacts]
+            .sort(
+              (a, b) =>
+                (summaries.get(b.peerId)?.last.sentAt ?? Date.parse(b.addedAt)) -
+                (summaries.get(a.peerId)?.last.sentAt ?? Date.parse(a.addedAt)),
+            )
+            .map((c) => {
+              const s = summaries.get(c.peerId);
+              return (
+                <li key={c.peerId}>
+                  <button
+                    type="button"
+                    className="chat-row chat-row-btn"
+                    aria-label={`Chat with ${c.handle}${s?.unread ? `, ${s.unread} unread` : ""}`}
+                    onClick={() => {
+                      setChatWith(c);
+                      setView("chat");
+                    }}
+                  >
+                    <Avatar name={c.handle} />
+                    <div className="chat-main">
+                      <span className="chat-name">{c.handle}</span>
+                      <span className="chat-sub">
+                        {s ? (
+                          <>
+                            {s.last.direction === "out" && (
+                              <span className="chat-sub-tick">
+                                <MessageTick status={s.last.status} />
+                              </span>
+                            )}
+                            {s.last.text}
+                          </>
+                        ) : (
+                          addedLabel(c.addedAt)
+                        )}
+                      </span>
+                    </div>
+                    {s && (
+                      <div className="chat-side">
+                        <span className="chat-time" data-unread={s.unread > 0}>
+                          {listTime(s.last.sentAt)}
+                        </span>
+                        {s.unread > 0 && <span className="unread-badge">{s.unread}</span>}
+                      </div>
+                    )}
+                  </button>
+                </li>
+              );
+            })}
         </ul>
       )}
+
+      <button type="button" className="fab" aria-label="New contact" onClick={() => setView("search")}>
+        <PlusMessageIcon size={26} />
+      </button>
 
       {confirmLogout && (
         <div className="dialog-backdrop" role="presentation" onClick={() => setConfirmLogout(false)}>
