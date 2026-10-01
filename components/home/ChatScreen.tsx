@@ -48,11 +48,14 @@ function dayLabel(ms: number): string {
 export default function ChatScreen({
   identity,
   contact,
+  avatarUrl,
   network,
   onBack,
 }: {
   identity: StoredIdentity;
   contact: Contact;
+  /** The contact's profile photo, if received. */
+  avatarUrl?: string;
   network: NetworkStatus;
   onBack: () => void;
 }) {
@@ -103,6 +106,8 @@ export default function ChatScreen({
       setPresence((await chat.isConnected(contact.peerId)) ? "online" : "connecting");
       const ok = await chat.connectTo(contact.peerId);
       if (alive) setPresence(ok ? "online" : "offline");
+      // Get their latest profile photo straight from their device.
+      if (ok) void import("@/lib/p2p/profile-share").then((p) => p.fetchAvatar(identity, contact.peerId));
     })();
     return () => {
       alive = false;
@@ -150,7 +155,7 @@ export default function ChatScreen({
         <button type="button" className="icon-btn" aria-label="Back" onClick={onBack}>
           <BackIcon />
         </button>
-        <Avatar name={contact.handle} size={38} />
+        <Avatar name={contact.handle} size={38} src={avatarUrl} />
         <div className="chat-head">
           <span className="chat-head-name">{contact.handle}</span>
           <span className="chat-head-status" data-presence={presence} aria-live="polite">

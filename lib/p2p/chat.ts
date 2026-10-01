@@ -30,7 +30,7 @@ import {
   saveMessage,
   type ChatMessage,
 } from "../messages";
-import { getNode, lookupHandle, onNodeStart, peerAddresses, type Node } from "./node";
+import { getNode, lookupHandle, onNodeStart, openPeerStream, peerAddresses, type Node } from "./node";
 
 export const CHAT_PROTOCOL = "/nodex/chat/1.0.0";
 const MAX_FRAME_BYTES = 16 * 1024;
@@ -211,21 +211,8 @@ async function receive(stream: Stream, connection: Connection, identity: StoredI
 // ------------------------------------------------------------------ sending
 
 /** Opens a chat stream to a peer: existing connection, else WebRTC via relay, else relayed. */
-async function openStream(node: Node, peerId: string): Promise<Stream> {
-  const pid = peerIdFromString(peerId);
-  const opts = { runOnLimitedConnection: true, signal: AbortSignal.timeout(DIAL_TIMEOUT_MS) };
-  if (node.getConnections(pid).length > 0) return node.dialProtocol(pid, CHAT_PROTOCOL, opts);
-  const addrs = peerAddresses(peerId);
-  try {
-    return await node.dialProtocol(addrs.webrtc.map((a) => multiaddr(a)), CHAT_PROTOCOL, {
-      signal: AbortSignal.timeout(DIAL_TIMEOUT_MS),
-    });
-  } catch {
-    return node.dialProtocol(addrs.relayed.map((a) => multiaddr(a)), CHAT_PROTOCOL, {
-      runOnLimitedConnection: true,
-      signal: AbortSignal.timeout(DIAL_TIMEOUT_MS),
-    });
-  }
+function openStream(node: Node, peerId: string): Promise<Stream> {
+  return openPeerStream(node, peerId, CHAT_PROTOCOL, DIAL_TIMEOUT_MS);
 }
 
 /** Tries to deliver one message; true once the recipient acknowledged it. */

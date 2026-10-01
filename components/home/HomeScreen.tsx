@@ -13,6 +13,7 @@ import ContactSearch from "./ContactSearch";
 import ProfileScreen from "./ProfileScreen";
 import { MessageTick } from "./ChatScreen";
 import { MoreIcon, PlusMessageIcon } from "./icons";
+import { useAvatarUrls } from "./useAvatarUrls";
 
 const PURGE_INTERVAL_MS = 60_000;
 
@@ -75,6 +76,8 @@ export default function HomeScreen() {
   const [confirmLogout, setConfirmLogout] = useState(false);
   const menuRef = useRef<HTMLDivElement>(null);
   const avatarUrl = useObjectUrl(avatar);
+  // Contacts' photos, received peer to peer and kept on this device.
+  const contactAvatars = useAvatarUrls(contacts.map((c) => c.peerId));
 
   // Logged in means an identity exists on this device. Only a missing
   // identity sends the user to /login; other load failures are shown here
@@ -127,7 +130,11 @@ export default function HomeScreen() {
     let purgeTimer: ReturnType<typeof setInterval> | undefined;
     let cancelled = false;
     // Load chat first: it registers its protocol handler for when the node starts.
-    Promise.all([import("@/lib/p2p/chat"), import("@/lib/p2p/node")]).then(([chat, { onStatus, startNetwork }]) => {
+    Promise.all([
+      import("@/lib/p2p/chat"),
+      import("@/lib/p2p/node"),
+      import("@/lib/p2p/profile-share"), // registers the photo-sharing protocol
+    ]).then(([chat, { onStatus, startNetwork }]) => {
       if (cancelled) return;
       unsubscribeStatus = onStatus(setNetwork);
       unsubscribeChat = chat.onChatEvent((e) => {
@@ -215,6 +222,7 @@ export default function HomeScreen() {
         <ChatScreen
           identity={identity}
           contact={chatWith}
+          avatarUrl={contactAvatars.get(chatWith.peerId)}
           network={network}
           onBack={() => {
             setView("contacts");
@@ -344,7 +352,7 @@ export default function HomeScreen() {
                       setView("chat");
                     }}
                   >
-                    <Avatar name={c.handle} />
+                    <Avatar name={c.handle} src={contactAvatars.get(c.peerId)} />
                     <div className="chat-main">
                       <span className="chat-name">{c.handle}</span>
                       <span className="chat-sub">

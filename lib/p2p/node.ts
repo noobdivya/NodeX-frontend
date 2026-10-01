@@ -14,6 +14,8 @@ import { identify } from "@libp2p/identify";
 import type { Libp2p } from "@libp2p/interface";
 import type { Multiaddr } from "@multiformats/multiaddr";
 import { kadDHT, passthroughMapper, type KadDHT } from "@libp2p/kad-dht";
+import { peerIdFromString } from "@libp2p/peer-id";
+import { multiaddr } from "@multiformats/multiaddr";
 import { ping } from "@libp2p/ping";
 import { webRTC } from "@libp2p/webrtc";
 import { webSockets } from "@libp2p/websockets";
@@ -105,6 +107,32 @@ export function peerAddresses(peerId: string): { webrtc: string[]; relayed: stri
     webrtc: BOOTSTRAP_PEERS.map((b) => `${b}/p2p-circuit/webrtc/p2p/${peerId}`),
     relayed: BOOTSTRAP_PEERS.map((b) => `${b}/p2p-circuit/p2p/${peerId}`),
   };
+}
+
+/**
+ * Opens a protocol stream to another browser: reuses an existing connection,
+ * else connects via WebRTC (relay carries only the handshake), else falls
+ * back to a relayed connection. Always end-to-end encrypted.
+ */
+export async function openPeerStream(node: Node, peerId: string, protocol: string, timeoutMs = 20_000) {
+  const pid = peerIdFromString(peerId);
+  if (node.getConnections(pid).length > 0) {
+    return node.dialProtocol(pid, protocol, { runOnLimitedConnection: true, signal: AbortSignal.timeout(timeoutMs) });
+  }
+  const addrs = peerAddresses(peerId);
+  try {
+    return await node.dialProtocol(
+      addrs.webrtc.map((a) => multiaddr(a)),
+      protocol,
+      { signal: AbortSignal.timeout(timeoutMs) },
+    );
+  } catch {
+    return node.dialProtocol(
+      addrs.relayed.map((a) => multiaddr(a)),
+      protocol,
+      { runOnLimitedConnection: true, signal: AbortSignal.timeout(timeoutMs) },
+    );
+  }
 }
 
 /** The running node, if any. */

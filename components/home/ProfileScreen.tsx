@@ -40,6 +40,8 @@ export default function ProfileScreen({
       const image = await toAvatarImage(file);
       await setAvatar(identity.peerId, image);
       onAvatarChange(image);
+      // Send the new photo straight to everyone currently connected.
+      void import("@/lib/p2p/profile-share").then((p) => p.pushAvatar(identity));
     } catch (err) {
       setError(err instanceof Error ? err.message : "Couldn't use that photo. Try another one.");
     } finally {
@@ -50,6 +52,7 @@ export default function ProfileScreen({
   async function remove() {
     await removeAvatar(identity.peerId);
     onAvatarChange(undefined);
+    void import("@/lib/p2p/profile-share").then((p) => p.pushAvatar(identity));
   }
 
   async function copy() {
@@ -119,8 +122,8 @@ export default function ProfileScreen({
           </div>
         </dl>
         <p className="hint profile-note">
-          This is your username/handle. Share it so people can find you on NodeX. Your photo is stored on this device
-          and is shared only directly with the people you connect to.
+          This is your username/handle. Share it so people can find you on NodeX. Your photo is visible to people who
+          find or chat with you: it&apos;s sent straight from your device to theirs, never to a server.
         </p>
       </div>
     </>

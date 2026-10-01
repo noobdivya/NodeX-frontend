@@ -6,6 +6,7 @@ import type { StoredIdentity } from "@/lib/keystore";
 import type { LookupResult, NetworkStatus } from "@/lib/p2p/node";
 import Avatar from "./Avatar";
 import { AddPersonIcon, BackIcon, CheckIcon, CloseIcon, SearchIcon } from "./icons";
+import { useAvatarUrls } from "./useAvatarUrls";
 
 type SearchState =
   | { status: "idle" }
@@ -39,6 +40,7 @@ export default function ContactSearch({
   const [query, setQuery] = useState("");
   const [state, setState] = useState<SearchState>({ status: "idle" });
   const key = normalizeHandle(query);
+  const resultAvatars = useAvatarUrls(state.status === "found" ? [state.result.peerId] : []);
 
   useEffect(() => {
     const onKey = (e: KeyboardEvent) => e.key === "Escape" && onBack();
@@ -61,6 +63,10 @@ export default function ContactSearch({
       const { lookupHandle } = await import("@/lib/p2p/node");
       const result = await lookupHandle(identity, query);
       setState(result ? { status: "found", result } : { status: "not_found", handle: query.trim() });
+      // Ask the person's device for their profile photo (shown when it arrives).
+      if (result && result.peerId !== identity.peerId) {
+        void import("@/lib/p2p/profile-share").then((p) => p.fetchAvatar(identity, result.peerId));
+      }
     } catch (err) {
       setState({ status: "error", message: err instanceof Error ? err.message : "Search failed." });
     }
@@ -142,7 +148,7 @@ export default function ContactSearch({
             <li className="chat-row">
               {state.result.peerId === identity.peerId ? (
                 <>
-                  <Avatar name={state.result.handle} />
+                  <Avatar name={state.result.handle} src={resultAvatars.get(state.result.peerId)} />
                   <div className="chat-main">
                     <span className="chat-name">{state.result.handle}</span>
                     <span className="chat-sub">This is you</span>
@@ -156,7 +162,7 @@ export default function ContactSearch({
                   aria-label={`Message ${state.result.handle}`}
                   onClick={() => onMessage(state.result)}
                 >
-                  <Avatar name={state.result.handle} />
+                  <Avatar name={state.result.handle} src={resultAvatars.get(state.result.peerId)} />
                   <div className="chat-main">
                     <span className="chat-name">{state.result.handle}</span>
                     <span className="chat-sub">
