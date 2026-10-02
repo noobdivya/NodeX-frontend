@@ -11,7 +11,27 @@ export type Contact = {
   /** Canonical lowercase form used for comparisons and lookups. */
   handleKey: string;
   addedAt: string;
+  /**
+   * When this device was last connected to them (ms since epoch). Recorded
+   * here, from this device's own connections; no server tracks it.
+   */
+  lastSeen?: number;
 };
+
+export async function getContact(ownerPeerId: string, peerId: string): Promise<Contact | undefined> {
+  return withStore(
+    STORES.contacts,
+    "readonly",
+    (s) => s.get([ownerPeerId, peerId]) as IDBRequest<Contact | undefined>,
+  );
+}
+
+/** Notes that a contact was online just now. Peers that aren't contacts are ignored. */
+export async function touchLastSeen(ownerPeerId: string, peerId: string, at = Date.now()): Promise<void> {
+  const contact = await getContact(ownerPeerId, peerId);
+  if (!contact || (contact.lastSeen ?? 0) >= at) return;
+  await withStore(STORES.contacts, "readwrite", (s) => s.put({ ...contact, lastSeen: at }));
+}
 
 export async function listContacts(ownerPeerId: string): Promise<Contact[]> {
   const all = await withStore(

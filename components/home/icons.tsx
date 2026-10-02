@@ -55,6 +55,9 @@ export const CameraIcon = ({ size = 24 }: P) =>
 
 export const DoubleCheckIcon = ({ size = 24 }: P) => svg(size, <path d="M2 13l4 4 8-9M10 16l1 1 11-12" />);
 
+export const AttachIcon = ({ size = 24 }: P) =>
+  svg(size, <path d="M21 11.5 12.5 20a5.5 5.5 0 0 1-7.8-7.8l8.5-8.5a3.7 3.7 0 0 1 5.2 5.2l-8.5 8.5a1.8 1.8 0 0 1-2.6-2.6l7.8-7.8" />);
+
 export const SendIcon = ({ size = 24 }: P) => svg(size, <path d="M4 12 20 4l-4 16-4-7-8-1Zm8 1 8-9" />);
 
 export const ClockIcon = ({ size = 24 }: P) =>

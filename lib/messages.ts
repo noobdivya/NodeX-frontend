@@ -4,6 +4,36 @@
 import { STORES, withStore } from "./db";
 
 export const MAX_MESSAGE_LENGTH = 4000;
+/** Largest video or document that can be sent. */
+export const MAX_FILE_BYTES = 50 * 1024 * 1024;
+/** Files up to this size download automatically; larger ones wait for a tap. */
+export const AUTO_DOWNLOAD_BYTES = 5 * 1024 * 1024;
+/** Video types browsers can play inline; everything else is a document. */
+export const PLAYABLE_VIDEO_TYPES = ["video/mp4", "video/webm", "video/ogg"];
+
+export type ChatFile = {
+  name: string;
+  /** MIME type as reported by the sender (used only to choose video vs document). */
+  type: string;
+  size: number;
+  /** SHA-256 (hex) of the whole file, checked after download. */
+  hash: string;
+  blob?: Blob;
+};
+
+export const isPlayableVideo = (f: ChatFile) => PLAYABLE_VIDEO_TYPES.includes(f.type);
+
+/** Removes path parts and control characters from a file name and limits its length. */
+export function safeFileName(name: string): string {
+  const base = name.replace(/[\\/]/g, "_").replace(/[\u0000-\u001f\u007f<>:"|?*]/g, "").trim();
+  return (base || "file").slice(0, 120);
+}
+
+export function formatBytes(n: number): string {
+  if (n < 1024) return `${n} B`;
+  if (n < 1024 * 1024) return `${Math.max(1, Math.round(n / 1024))} KB`;
+  return `${(n / (1024 * 1024)).toFixed(n < 10 * 1024 * 1024 ? 1 : 0)} MB`;
+}
 
 export type MessageStatus =
   /** Outgoing, not yet acknowledged by the recipient's device (queued). */
@@ -22,7 +52,16 @@ export type ChatMessage = {
   /** The other person in the conversation. */
   peerId: string;
   direction: "in" | "out";
+  /** Message text, or the caption when `image` is set (may then be empty). */
   text: string;
+  /** A photo sent as a message, stored on this device with the message. */
+  image?: { blob: Blob; width: number; height: number };
+  /**
+   * A video or document. The message carries only this description; the
+   * bytes are pulled from the sender's device afterwards (`blob` is set on
+   * the sender straight away, and on the receiver once downloaded).
+   */
+  file?: ChatFile;
   /** Sender's clock, ms since epoch. */
   sentAt: number;
   status: MessageStatus;
@@ -35,7 +74,31 @@ export type ChatMessage = {
    * recipient, from their read receipt). Messages disappear 48 hours later.
    */
   readAt?: number;
+  /** The message this one replies to, with a short copy of it to show as a quote. */
+  replyTo?: { id: string; preview: string };
+  /** Passed on from another chat. */
+  forwarded?: boolean;
+  /**
+   * Deleted for everyone: the content is gone and only this marker remains
+   * ("This message was deleted").
+   */
+  deleted?: boolean;
+  /** Outgoing deleted messages: whether the other device has been told. */
+  deleteSent?: boolean;
 };
+
+export const MAX_PREVIEW_LENGTH = 120;
+
+/** One line describing a message, for quotes and the chat list. */
+export function messagePreview(m: ChatMessage): string {
+  if (m.deleted) return m.direction === "out" ? "🚫 You deleted this message" : "🚫 This message was deleted";
+  const text = m.image
+    ? `📷 ${m.text || "Photo"}`
+    : m.file
+      ? `${isPlayableVideo(m.file) ? "🎬" : "📄"} ${m.text || m.file.name}`
+      : m.text;
+  return text.length > MAX_PREVIEW_LENGTH ? `${text.slice(0, MAX_PREVIEW_LENGTH - 1)}…` : text;
+}
 
 /** Messages are deleted from this device this long after they were read. */
 export const DISAPPEAR_AFTER_READ_MS = 48 * 60 * 60 * 1000;
@@ -48,6 +111,42 @@ export async function saveMessage(m: ChatMessage): Promise<void> {
 
 export async function getMessage(id: string): Promise<ChatMessage | undefined> {
   return withStore(STORES.messages, "readonly", (s) => s.get(id) as IDBRequest<ChatMessage | undefined>);
+}
+
+export async function deleteMessage(id: string): Promise<void> {
+  await withStore(STORES.messages, "readwrite", (s) => s.delete(id));
+}
+
+/** What's left of a message after it was deleted for everyone. */
+export function tombstone(m: ChatMessage, now = Date.now()): ChatMessage {
+  return {
+    id: m.id,
+    ownerPeerId: m.ownerPeerId,
+    peerId: m.peerId,
+    direction: m.direction,
+    text: "",
+    sentAt: m.sentAt,
+    status: m.status === "pending" ? "delivered" : m.status,
+    read: true,
+    receiptSent: true,
+    // The marker itself disappears 48 hours later.
+    readAt: m.readAt ?? now,
+    deleted: true,
+    ...(m.direction === "out" ? { deleteSent: m.deleteSent ?? false } : {}),
+  };
+}
+
+/** Deleted outgoing messages the other person's device hasn't been told about yet. */
+export async function listUnsentDeletes(ownerPeerId: string, peerId?: string): Promise<ChatMessage[]> {
+  const all = await withStore(STORES.messages, "readonly", (s) => s.getAll() as IDBRequest<ChatMessage[]>);
+  return all.filter(
+    (m) =>
+      m.ownerPeerId === ownerPeerId &&
+      (!peerId || m.peerId === peerId) &&
+      m.direction === "out" &&
+      m.deleted &&
+      !m.deleteSent,
+  );
 }
 
 /** A conversation's messages, oldest first. */
@@ -114,6 +213,8 @@ export async function deleteExpiredMessages(ownerPeerId: string, now = Date.now(
       continue;
     }
     if (m.readAt === undefined || now - m.readAt < DISAPPEAR_AFTER_READ_MS) continue;
+    // Keep a deletion until the other device has been told about it.
+    if (m.deleted && m.direction === "out" && !m.deleteSent) continue;
     await withStore(STORES.messages, "readwrite", (s) => s.delete(m.id));
     changed.add(m.peerId);
   }

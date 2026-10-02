@@ -1,12 +1,24 @@
 "use client";
 
 import { useEffect, useLayoutEffect, useRef, useState } from "react";
-import type { Contact } from "@/lib/contacts";
+import { getContact, listContacts, type Contact } from "@/lib/contacts";
 import type { StoredIdentity } from "@/lib/keystore";
-import { listMessages, markConversationRead, MAX_MESSAGE_LENGTH, type ChatMessage } from "@/lib/messages";
+import type { ChatImage } from "@/lib/image";
+import {
+  formatBytes,
+  listMessages,
+  markConversationRead,
+  MAX_FILE_BYTES,
+  MAX_MESSAGE_LENGTH,
+  messagePreview,
+  safeFileName,
+  type ChatMessage,
+} from "@/lib/messages";
 import type { NetworkStatus } from "@/lib/p2p/node";
 import Avatar from "./Avatar";
-import { BackIcon, CheckIcon, ClockIcon, DoubleCheckIcon, SendIcon } from "./icons";
+import EmojiPicker, { isJumboEmoji } from "./EmojiPicker";
+import FileAttachment from "./FileAttachment";
+import { AttachIcon, BackIcon, CheckIcon, ClockIcon, CloseIcon, DoubleCheckIcon, MoreIcon, SendIcon } from "./icons";
 
 /** 🕓 waiting · ✓ delivered · ✓✓ read */
 export function MessageTick({ status, size = 14 }: { status: ChatMessage["status"]; size?: number }) {
@@ -31,6 +43,47 @@ export function MessageTick({ status, size = 14 }: { status: ChatMessage["status
   );
 }
 
+/** Object URL for a Blob, revoked when it changes or the component unmounts. */
+function useBlobUrl(blob: Blob | undefined): string | undefined {
+  const [url, setUrl] = useState<string>();
+  useEffect(() => {
+    if (!blob) {
+      setUrl(undefined);
+      return;
+    }
+    const u = URL.createObjectURL(blob);
+    setUrl(u);
+    return () => URL.revokeObjectURL(u);
+  }, [blob]);
+  return url;
+}
+
+/** A photo inside a message bubble; tap to view it full screen. */
+function MessagePhoto({
+  image,
+  alt,
+  onOpen,
+}: {
+  image: NonNullable<ChatMessage["image"]>;
+  alt: string;
+  onOpen: (url: string) => void;
+}) {
+  const url = useBlobUrl(image.blob);
+  // Reserve the right shape before the image loads, so the chat doesn't jump.
+  const ratio = image.width / image.height;
+  return (
+    <button
+      type="button"
+      className="bubble-photo"
+      style={{ aspectRatio: String(ratio), width: Math.min(280, Math.max(140, Math.round(240 * ratio))) }}
+      aria-label={`Open photo${alt ? `: ${alt}` : ""}`}
+      onClick={() => url && onOpen(url)}
+    >
+      {url && <img src={url} alt={alt || "Photo"} />}
+    </button>
+  );
+}
+
 function timeLabel(ms: number): string {
   return new Date(ms).toLocaleTimeString(undefined, { hour: "2-digit", minute: "2-digit" });
 }
@@ -42,6 +95,15 @@ function dayLabel(ms: number): string {
   if (d.toDateString() === today.toDateString()) return "Today";
   if (d.toDateString() === yesterday.toDateString()) return "Yesterday";
   return d.toLocaleDateString(undefined, { day: "numeric", month: "short", year: "numeric" });
+}
+
+/** "last seen today at 11:05", from when this device was last connected to them. */
+function lastSeenLabel(ms: number): string {
+  const d = new Date(ms);
+  const time = timeLabel(ms);
+  if (d.toDateString() === new Date().toDateString()) return `last seen today at ${time}`;
+  if (d.toDateString() === new Date(Date.now() - 86_400_000).toDateString()) return `last seen yesterday at ${time}`;
+  return `last seen ${d.toLocaleDateString(undefined, { day: "numeric", month: "short" })} at ${time}`;
 }
 
 /** One-to-one chat, delivered directly peer to peer. */
@@ -63,8 +125,75 @@ export default function ChatScreen({
   const [text, setText] = useState("");
   const [presence, setPresence] = useState<"online" | "connecting" | "offline">("connecting");
   const [error, setError] = useState<string | null>(null);
+  const [emojiOpen, setEmojiOpen] = useState(false);
+  /** A photo chosen but not yet sent (the text box becomes its caption). */
+  const [photo, setPhoto] = useState<ChatImage | null>(null);
+  /** A video or document chosen but not yet sent. */
+  const [doc, setDoc] = useState<File | null>(null);
+  const [preparing, setPreparing] = useState(false);
+  /** Photo currently opened full screen. */
+  const [viewer, setViewer] = useState<string | null>(null);
+  /** When this device was last connected to them. */
+  const [lastSeen, setLastSeen] = useState<number | undefined>(contact.lastSeen);
+  /** The message being replied to. */
+  const [replyTo, setReplyTo] = useState<ChatMessage | null>(null);
+  /** The message whose actions (reply, forward, delete) are open. */
+  const [actionFor, setActionFor] = useState<ChatMessage | null>(null);
+  /** The message being forwarded, while choosing who to send it to. */
+  const [forwarding, setForwarding] = useState<ChatMessage | null>(null);
+  const [forwardTargets, setForwardTargets] = useState<Contact[]>([]);
+  const [notice, setNotice] = useState<string | null>(null);
   const listRef = useRef<HTMLDivElement>(null);
   const inputRef = useRef<HTMLTextAreaElement>(null);
+  const fileRef = useRef<HTMLInputElement>(null);
+  const photoUrl = useBlobUrl(photo?.blob);
+
+  /**
+   * Attaches a chosen or pasted file. Images become photos (resized and
+   * compressed on this device); anything else is a video or document, sent
+   * as-is and downloaded by the other person straight from this device.
+   */
+  async function attach(file: Blob | undefined | null) {
+    if (!file) return;
+    setError(null);
+    if (!file.type.startsWith("image/")) {
+      if (file.size === 0) {
+        setError("That file is empty.");
+      } else if (file.size > MAX_FILE_BYTES) {
+        setError(`That file is too large. The limit is ${formatBytes(MAX_FILE_BYTES)}.`);
+      } else {
+        setPhoto(null);
+        setDoc(file instanceof File ? file : new File([file], "file", { type: file.type }));
+        inputRef.current?.focus();
+      }
+      return;
+    }
+    setPreparing(true);
+    try {
+      const { toChatImage } = await import("@/lib/image");
+      setDoc(null);
+      setPhoto(await toChatImage(file));
+      inputRef.current?.focus();
+    } catch (err) {
+      setError(err instanceof Error ? err.message : "Couldn't use that photo. Try another one.");
+    } finally {
+      setPreparing(false);
+    }
+  }
+
+  /** Inserts an emoji at the cursor (replacing any selection) and keeps typing there. */
+  function insertEmoji(emoji: string) {
+    const el = inputRef.current;
+    const start = el?.selectionStart ?? text.length;
+    const end = el?.selectionEnd ?? text.length;
+    const next = text.slice(0, start) + emoji + text.slice(end);
+    if (next.length > MAX_MESSAGE_LENGTH) return;
+    setText(next);
+    requestAnimationFrame(() => {
+      el?.focus();
+      el?.setSelectionRange(start + emoji.length, start + emoji.length);
+    });
+  }
 
   // Load history, mark as read, and follow live events.
   useEffect(() => {
@@ -79,9 +208,13 @@ export default function ChatScreen({
       await markConversationRead(identity.peerId, contact.peerId);
       chat.notifyRead(identity, contact.peerId);
       if (!alive) return;
+      void getContact(identity.peerId, contact.peerId).then((c) => alive && c?.lastSeen && setLastSeen(c.lastSeen));
       unsubscribe = chat.onChatEvent((e) => {
         if (e.type === "presence") {
-          if (e.peerId === contact.peerId) setPresence(e.online ? "online" : "offline");
+          if (e.peerId === contact.peerId) {
+            setPresence(e.online ? "online" : "offline");
+            setLastSeen(Date.now());
+          }
           return;
         }
         if (e.type === "deleted") {
@@ -120,23 +253,117 @@ export default function ChatScreen({
     listRef.current?.scrollTo({ top: listRef.current.scrollHeight });
   }, [messages.length]);
 
+  // Escape closes whatever is on top: dialogs, photo viewer, emoji picker, reply, then the chat.
   useEffect(() => {
-    const onKey = (e: KeyboardEvent) => e.key === "Escape" && onBack();
+    const onKey = (e: KeyboardEvent) => {
+      if (e.key !== "Escape") return;
+      if (actionFor) setActionFor(null);
+      else if (forwarding) setForwarding(null);
+      else if (viewer) setViewer(null);
+      else if (emojiOpen) setEmojiOpen(false);
+      else if (replyTo) setReplyTo(null);
+      else onBack();
+    };
     document.addEventListener("keydown", onKey);
     return () => document.removeEventListener("keydown", onKey);
-  }, [onBack]);
+  }, [onBack, emojiOpen, viewer, actionFor, forwarding, replyTo]);
 
-  async function send() {
-    const value = text.trim();
-    if (!value) return;
+  // A short confirmation ("Forwarded to …") clears by itself.
+  useEffect(() => {
+    if (!notice) return;
+    const timer = setTimeout(() => setNotice(null), 3000);
+    return () => clearTimeout(timer);
+  }, [notice]);
+
+  // Drop the reply if the message it points at was deleted meanwhile.
+  useEffect(() => {
+    if (replyTo && !messages.some((m) => m.id === replyTo.id && !m.deleted)) setReplyTo(null);
+  }, [messages, replyTo]);
+
+  /** Scrolls to a quoted message and highlights it briefly. */
+  function jumpTo(id: string) {
+    const el = listRef.current?.querySelector<HTMLElement>(`[data-id="${CSS.escape(id)}"]`);
+    if (!el) return;
+    el.scrollIntoView({ block: "center", behavior: "smooth" });
+    el.dataset.flash = "true";
+    setTimeout(() => delete el.dataset.flash, 1200);
+  }
+
+  function startReply(m: ChatMessage) {
+    setActionFor(null);
+    setReplyTo(m);
+    inputRef.current?.focus();
+  }
+
+  async function startForward(m: ChatMessage) {
+    setActionFor(null);
+    setForwardTargets(await listContacts(identity.peerId));
+    setForwarding(m);
+  }
+
+  /** Sends a copy of the message to another chat, straight from this device. */
+  async function forwardTo(target: Contact) {
+    const m = forwarding;
+    setForwarding(null);
+    if (!m) return;
     setError(null);
     try {
       const { sendMessage } = await import("@/lib/p2p/chat");
-      await sendMessage(identity, contact.peerId, value);
+      await sendMessage(identity, target.peerId, m.text, m.image, m.file, { forwarded: true });
+      setNotice(`Forwarded to ${target.handle}`);
+    } catch (err) {
+      setError(err instanceof Error ? err.message : "Couldn't forward the message.");
+    }
+  }
+
+  async function remove(m: ChatMessage, everyone: boolean) {
+    setActionFor(null);
+    const chat = await import("@/lib/p2p/chat");
+    if (everyone) await chat.deleteForEveryone(identity, m);
+    else await chat.deleteForMe(m);
+  }
+
+  const authorOf = (id: string) => (id.startsWith(`${identity.peerId}:`) ? "You" : contact.handle);
+
+  async function send() {
+    const value = text.trim();
+    if ((!value && !photo && !doc) || preparing) return;
+    setError(null);
+    try {
+      const { sendMessage } = await import("@/lib/p2p/chat");
+      if (doc) {
+        // Fingerprint the file so the receiver can check it arrived intact.
+        setPreparing(true);
+        const { sha256Hex } = await import("@/lib/profile");
+        const hash = await sha256Hex(new Uint8Array(await doc.arrayBuffer()));
+        await sendMessage(
+          identity,
+          contact.peerId,
+          value,
+          undefined,
+          { name: safeFileName(doc.name), type: doc.type || "application/octet-stream", size: doc.size, hash, blob: doc },
+          { replyTo: replyTo ?? undefined },
+        );
+      } else {
+        await sendMessage(identity, contact.peerId, value, photo ?? undefined, undefined, {
+          replyTo: replyTo ?? undefined,
+        });
+      }
+      setReplyTo(null);
       setText("");
+      setPhoto(null);
+      setDoc(null);
       inputRef.current?.focus();
     } catch (err) {
-      setError(err instanceof Error ? err.message : "Couldn't send the message.");
+      setError(
+        err instanceof DOMException && err.name === "QuotaExceededError"
+          ? "There isn't enough storage space on this device for that file."
+          : err instanceof Error
+            ? err.message
+            : "Couldn't send the message.",
+      );
+    } finally {
+      setPreparing(false);
     }
   }
 
@@ -147,7 +374,9 @@ export default function ChatScreen({
         ? "online"
         : presence === "connecting"
           ? "connecting…"
-          : "offline · messages will be delivered when they're online";
+          : lastSeen
+            ? lastSeenLabel(lastSeen)
+            : "offline · messages will be delivered when they're online";
 
   return (
     <div className="chat">
@@ -175,11 +404,48 @@ export default function ChatScreen({
           return (
             <div key={m.id}>
               {showDay && <p className="chat-day">{dayLabel(m.sentAt)}</p>}
-              <div className="bubble" data-dir={m.direction} data-status={m.status}>
-                <span className="bubble-text">{m.text}</span>
+              <div
+                className="bubble"
+                data-dir={m.direction}
+                data-status={m.status}
+                data-photo={!!m.image || !!m.file || undefined}
+                data-deleted={m.deleted || undefined}
+                data-id={m.id}
+                onContextMenu={(e) => {
+                  e.preventDefault();
+                  setActionFor(m);
+                }}
+              >
+                <button
+                  type="button"
+                  className="bubble-more"
+                  aria-label="Message options"
+                  title="Reply, forward or delete"
+                  onClick={() => setActionFor(m)}
+                >
+                  <MoreIcon size={16} />
+                </button>
+                {m.forwarded && !m.deleted && <span className="bubble-forwarded">↪ Forwarded</span>}
+                {m.replyTo && !m.deleted && (
+                  <button type="button" className="bubble-quote" onClick={() => jumpTo(m.replyTo!.id)}>
+                    <strong>{authorOf(m.replyTo.id)}</strong>
+                    <span>{m.replyTo.preview}</span>
+                  </button>
+                )}
+                {m.deleted && <span className="bubble-text bubble-deleted">{messagePreview(m)}</span>}
+                {m.image && <MessagePhoto image={m.image} alt={m.text} onOpen={setViewer} />}
+                {m.file && <FileAttachment message={m} identity={identity} />}
+                {m.text && (
+                  <span
+                    className="bubble-text"
+                    data-jumbo={(!m.image && !m.file && isJumboEmoji(m.text)) || undefined}
+                  >
+                    {m.text}
+                  </span>
+                )}
                 <span className="bubble-meta">
                   {timeLabel(m.sentAt)}
-                  {m.direction === "out" && <MessageTick status={m.status} />}
+                  {m.direction === "out" && !m.deleted && <MessageTick status={m.status} />}
                 </span>
               </div>
             </div>
@@ -192,6 +458,54 @@ export default function ChatScreen({
           {error}
         </p>
       )}
+      {notice && (
+        <p className="search-hint" role="status">
+          {notice}
+        </p>
+      )}
+      {replyTo && (
+        <div className="reply-bar">
+          <div className="bubble-quote">
+            <strong>Replying to {authorOf(replyTo.id) === "You" ? "yourself" : contact.handle}</strong>
+            <span>{messagePreview(replyTo)}</span>
+          </div>
+          <button type="button" className="icon-btn icon-btn-sm" aria-label="Cancel reply" onClick={() => setReplyTo(null)}>
+            <CloseIcon size={18} />
+          </button>
+        </div>
+      )}
+      {doc && (
+        <div className="photo-preview">
+          <span className="file-icon" aria-hidden="true">
+            {doc.type.startsWith("video/") ? "🎬" : "📄"}
+          </span>
+          <span className="hint">
+            <strong className="file-name">{doc.name}</strong>
+            {preparing ? "Preparing file…" : `${formatBytes(doc.size)}. Add a caption or press send.`}
+          </span>
+          {!preparing && (
+            <button type="button" className="icon-btn icon-btn-sm" aria-label="Remove file" onClick={() => setDoc(null)}>
+              <CloseIcon size={18} />
+            </button>
+          )}
+        </div>
+      )}
+      {!doc && (photo || preparing) && (
+        <div className="photo-preview">
+          {photoUrl ? <img src={photoUrl} alt="Photo to send" /> : <span className="hint">Preparing photo…</span>}
+          {photo && (
+            <>
+              <span className="hint">
+                Photo ready · {Math.max(1, Math.round(photo.blob.size / 1024))} KB. Add a caption or press send.
+              </span>
+              <button type="button" className="icon-btn icon-btn-sm" aria-label="Remove photo" onClick={() => setPhoto(null)}>
+                <CloseIcon size={18} />
+              </button>
+            </>
+          )}
+        </div>
+      )}
+      {emojiOpen && <EmojiPicker onPick={insertEmoji} />}
       <form
         className="composer"
         onSubmit={(e) => {
@@ -199,6 +513,37 @@ export default function ChatScreen({
           void send();
         }}
       >
+        <button
+          type="button"
+          className="emoji-toggle"
+          aria-label="Attach a photo, video or document"
+          title="Attach a photo, video or document"
+          onClick={() => fileRef.current?.click()}
+        >
+          <AttachIcon size={22} />
+        </button>
+        <input
+          ref={fileRef}
+          type="file"
+          className="sr-only"
+          tabIndex={-1}
+          aria-hidden="true"
+          onChange={(e) => {
+            const file = e.target.files?.[0];
+            e.target.value = ""; // allow picking the same file again
+            void attach(file);
+          }}
+        />
+        <button
+          type="button"
+          className="emoji-toggle"
+          aria-label={emojiOpen ? "Close emoji picker" : "Open emoji picker"}
+          aria-expanded={emojiOpen}
+          onMouseDown={(e) => e.preventDefault()}
+          onClick={() => setEmojiOpen((o) => !o)}
+        >
+          {emojiOpen ? "⌨️" : "😊"}
+        </button>
         <label htmlFor="message" className="sr-only">
           Message
         </label>
@@ -208,9 +553,17 @@ export default function ChatScreen({
           rows={1}
           autoFocus
           maxLength={MAX_MESSAGE_LENGTH}
-          placeholder="Message"
+          placeholder={photo || doc ? "Add a caption…" : "Message"}
           value={text}
           onChange={(e) => setText(e.target.value)}
+          onPaste={(e) => {
+            // Pasting an image (e.g. a screenshot) attaches it as a photo.
+            const item = [...e.clipboardData.items].find((i) => i.type.startsWith("image/"));
+            if (item) {
+              e.preventDefault();
+              void attach(item.getAsFile());
+            }
+          }}
           onKeyDown={(e) => {
             if (e.key === "Enter" && !e.shiftKey) {
               e.preventDefault();
@@ -218,10 +571,89 @@ export default function ChatScreen({
             }
           }}
         />
-        <button type="submit" className="send-btn" aria-label="Send" disabled={!text.trim()}>
+        <button type="submit" className="send-btn" aria-label="Send" disabled={(!text.trim() && !photo && !doc) || preparing}>
           <SendIcon size={22} />
         </button>
       </form>
+
+      {actionFor && (
+        <div className="dialog-backdrop" role="presentation" onClick={() => setActionFor(null)}>
+          <div
+            className="dialog action-sheet"
+            role="dialog"
+            aria-modal="true"
+            aria-label="Message options"
+            onClick={(e) => e.stopPropagation()}
+          >
+            <p className="action-preview">{messagePreview(actionFor)}</p>
+            {!actionFor.deleted && (
+              <>
+                <button type="button" className="menu-item" autoFocus onClick={() => startReply(actionFor)}>
+                  ↩ Reply
+                </button>
+                {/* A file can be passed on only once it's on this device. */}
+                {(!actionFor.file || actionFor.file.blob) && (
+                  <button type="button" className="menu-item" onClick={() => void startForward(actionFor)}>
+                    ↪ Forward
+                  </button>
+                )}
+              </>
+            )}
+            <button type="button" className="menu-item" onClick={() => void remove(actionFor, false)}>
+              🗑 Delete for me
+            </button>
+            {actionFor.direction === "out" && !actionFor.deleted && (
+              <button type="button" className="menu-item menu-item-danger" onClick={() => void remove(actionFor, true)}>
+                🗑 Delete for everyone
+              </button>
+            )}
+            <div className="dialog-actions">
+              <button type="button" className="link-btn" onClick={() => setActionFor(null)}>
+                Cancel
+              </button>
+            </div>
+          </div>
+        </div>
+      )}
+
+      {forwarding && (
+        <div className="dialog-backdrop" role="presentation" onClick={() => setForwarding(null)}>
+          <div
+            className="dialog action-sheet"
+            role="dialog"
+            aria-modal="true"
+            aria-labelledby="forward-title"
+            onClick={(e) => e.stopPropagation()}
+          >
+            <h2 id="forward-title">Forward to…</h2>
+            <p className="action-preview">{messagePreview(forwarding)}</p>
+            <ul className="forward-list">
+              {forwardTargets.map((c) => (
+                <li key={c.peerId}>
+                  <button type="button" className="menu-item forward-target" onClick={() => void forwardTo(c)}>
+                    <Avatar name={c.handle} size={32} />
+                    {c.handle}
+                  </button>
+                </li>
+              ))}
+            </ul>
+            <div className="dialog-actions">
+              <button type="button" className="link-btn" autoFocus onClick={() => setForwarding(null)}>
+                Cancel
+              </button>
+            </div>
+          </div>
+        </div>
+      )}
+
+      {viewer && (
+        <div className="photo-viewer" role="dialog" aria-modal="true" aria-label="Photo" onClick={() => setViewer(null)}>
+          <button type="button" className="icon-btn photo-viewer-close" aria-label="Close photo" autoFocus>
+            <CloseIcon />
+          </button>
+          <img src={viewer} alt="Photo" onClick={(e) => e.stopPropagation()} />
+        </div>
+      )}
     </div>
   );
 }

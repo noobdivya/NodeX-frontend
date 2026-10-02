@@ -4,7 +4,7 @@ import { useRouter } from "next/navigation";
 import { useCallback, useEffect, useRef, useState } from "react";
 import { addContact, listContacts, removeContact, type Contact } from "@/lib/contacts";
 import { clearIdentity, getIdentity, type StoredIdentity } from "@/lib/keystore";
-import { listConversations, type ConversationSummary } from "@/lib/messages";
+import { listConversations, messagePreview, type ConversationSummary } from "@/lib/messages";
 import type { LookupResult, NetworkStatus } from "@/lib/p2p/node";
 import { getAvatar } from "@/lib/profile";
 import Avatar from "./Avatar";
@@ -134,6 +134,7 @@ export default function HomeScreen() {
       import("@/lib/p2p/chat"),
       import("@/lib/p2p/node"),
       import("@/lib/p2p/profile-share"), // registers the photo-sharing protocol
+      import("@/lib/p2p/file-transfer"), // registers the video/document transfer protocol
     ]).then(([chat, { onStatus, startNetwork }]) => {
       if (cancelled) return;
       unsubscribeStatus = onStatus(setNetwork);
@@ -358,12 +359,12 @@ export default function HomeScreen() {
                       <span className="chat-sub">
                         {s ? (
                           <>
-                            {s.last.direction === "out" && (
+                            {s.last.direction === "out" && !s.last.deleted && (
                               <span className="chat-sub-tick">
                                 <MessageTick status={s.last.status} />
                               </span>
                             )}
-                            {s.last.text}
+                            {messagePreview(s.last)}
                           </>
                         ) : (
                           addedLabel(c.addedAt)

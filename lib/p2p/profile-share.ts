@@ -49,7 +49,8 @@ const write = (lp: ReturnType<typeof lpStream>, data: Uint8Array) =>
   lp.write(data, { signal: AbortSignal.timeout(IO_TIMEOUT_MS) });
 const writeHeader = (lp: ReturnType<typeof lpStream>, h: Header) => write(lp, enc.encode(JSON.stringify(h)));
 
-function magicMatches(type: string, b: Uint8Array): boolean {
+/** Whether the bytes really start like an image of the claimed type. */
+export function magicMatches(type: string, b: Uint8Array): boolean {
   if (type === "image/png") return b[0] === 0x89 && b[1] === 0x50 && b[2] === 0x4e && b[3] === 0x47;
   if (type === "image/jpeg") return b[0] === 0xff && b[1] === 0xd8 && b[2] === 0xff;
   if (type === "image/webp") {
