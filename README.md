@@ -15,6 +15,18 @@
   <img alt="P2P" src="https://img.shields.io/badge/P2P-libp2p-2dd4bf">
 </p>
 
+<p align="center">
+  <a href="https://node-x-frontend-red.vercel.app"><strong>▶ Try NodeX: node-x-frontend-red.vercel.app</strong></a>
+</p>
+
+| Live | Address |
+|---|---|
+| **App** (Vercel) | <https://node-x-frontend-red.vercel.app> |
+| Email verifier (Render) | <https://nodex-verifier.onrender.com> |
+| P2P node (Render) | `/dns4/nodex-node.onrender.com/tcp/443/wss/p2p/12D3KooWPXJbYpESjgy7rxyTgS6szXv373DHJBjidVRbzgSRAfr3` |
+
+> The backend runs on Render's free plan, so after a quiet spell the first visit can take about a minute while it wakes up; the app connects by itself once it does. To try chat, open the app in a normal and a private window, create two identities, and search for one from the other by its handle.
+
 This repository is the **NodeX web app** (Next.js). It needs two small services from the **[NodeX-backend](https://github.com/noobdivya/NodeX-backend)** repository: a **P2P node** that browsers join the network through, and an **email verifier** used once at sign-up.
 
 ---
