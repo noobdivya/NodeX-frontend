@@ -8,7 +8,7 @@
 // re-derives from (name, Peer ID, email commitment). Every peer checks this
 // locally, so a result can be trusted without trusting whoever served it.
 //
-// Must stay byte-for-byte compatible with NodeX-node/record.go.
+// Must stay byte-for-byte compatible with record.go in the NodeX-backend repository (p2p-node/).
 import type { PrivateKey } from "@libp2p/interface";
 import { peerIdFromString } from "@libp2p/peer-id";
 import { fromBase64, toBase64 } from "../encoding";
