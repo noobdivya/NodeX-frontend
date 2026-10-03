@@ -16,6 +16,9 @@ export default function Home() {
         <p className="muted-foot">
           Already have a NodeX identity? <Link href="/login">Log in</Link>
         </p>
+        <p className="muted-foot">
+          <Link href="/privacy">Privacy policy</Link>
+        </p>
       </div>
     </main>
   );

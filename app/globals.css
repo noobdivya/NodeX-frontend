@@ -1541,3 +1541,34 @@ textarea.phrase-input:focus {
   font-size: 13.5px;
   color: var(--muted);
 }
+
+/* ---- Privacy policy ---- */
+
+.card.card-wide {
+  max-width: 720px;
+}
+
+.policy h2 {
+  margin: 24px 0 6px;
+  font-size: 16px;
+}
+
+.policy p,
+.policy li {
+  color: var(--muted);
+  font-size: 14.5px;
+  line-height: 1.6;
+}
+
+.policy p {
+  margin: 0 0 10px;
+}
+
+.policy ul {
+  margin: 0 0 10px;
+  padding-left: 20px;
+}
+
+.policy a {
+  color: var(--accent-strong);
+}
