@@ -1,7 +1,7 @@
 "use client";
 
 import { useEffect, useLayoutEffect, useRef, useState } from "react";
-import { getContact, listContacts, type Contact } from "@/lib/contacts";
+import { addContact, getContact, listContacts, type Contact } from "@/lib/contacts";
 import type { StoredIdentity } from "@/lib/keystore";
 import type { ChatImage } from "@/lib/image";
 import {
@@ -143,6 +143,17 @@ export default function ChatScreen({
   const [forwarding, setForwarding] = useState<ChatMessage | null>(null);
   const [forwardTargets, setForwardTargets] = useState<Contact[]>([]);
   const [notice, setNotice] = useState<string | null>(null);
+  /** Whether this user has blocked the contact. */
+  const [blocked, setBlocked] = useState(!!contact.blocked);
+  const [headMenu, setHeadMenu] = useState(false);
+  const [confirmBlock, setConfirmBlock] = useState(false);
+  /** One of the user's own messages being edited in the message box. */
+  const [editing, setEditing] = useState<ChatMessage | null>(null);
+  /** They are typing to this user right now. */
+  const [typing, setTyping] = useState(false);
+  /** They messaged this user but weren't saved as a contact. */
+  const [unsaved, setUnsaved] = useState(!!contact.auto);
+  const typingTimer = useRef<ReturnType<typeof setTimeout>>(undefined);
   const listRef = useRef<HTMLDivElement>(null);
   const inputRef = useRef<HTMLTextAreaElement>(null);
   const fileRef = useRef<HTMLInputElement>(null);
@@ -208,15 +219,29 @@ export default function ChatScreen({
       await markConversationRead(identity.peerId, contact.peerId);
       chat.notifyRead(identity, contact.peerId);
       if (!alive) return;
-      void getContact(identity.peerId, contact.peerId).then((c) => alive && c?.lastSeen && setLastSeen(c.lastSeen));
+      void getContact(identity.peerId, contact.peerId).then((c) => {
+        if (!alive || !c) return;
+        if (c.lastSeen) setLastSeen(c.lastSeen);
+        setBlocked(!!c.blocked);
+        setUnsaved(!!c.auto);
+      });
       unsubscribe = chat.onChatEvent((e) => {
         if (e.type === "presence") {
           if (e.peerId === contact.peerId) {
             setPresence(e.online ? "online" : "offline");
             setLastSeen(Date.now());
+            if (!e.online) setTyping(false);
           }
           return;
         }
+        if (e.type === "typing") {
+          if (e.peerId !== contact.peerId) return;
+          setTyping(true);
+          clearTimeout(typingTimer.current);
+          typingTimer.current = setTimeout(() => setTyping(false), chat.TYPING_SHOW_MS);
+          return;
+        }
+        if (e.type === "read") return;
         if (e.type === "deleted") {
           if (e.peerIds.includes(contact.peerId)) {
             void listMessages(identity.peerId, contact.peerId).then((m) => alive && setMessages(m));
@@ -231,6 +256,7 @@ export default function ChatScreen({
         });
         // A message arriving while this chat is open is read immediately.
         if (e.type === "message" && e.message.direction === "in") {
+          setTyping(false);
           void markConversationRead(identity.peerId, contact.peerId).then(() =>
             chat.notifyRead(identity, contact.peerId),
           );
@@ -245,6 +271,7 @@ export default function ChatScreen({
     return () => {
       alive = false;
       unsubscribe?.();
+      clearTimeout(typingTimer.current);
     };
   }, [identity.peerId, contact.peerId]);
 
@@ -258,15 +285,39 @@ export default function ChatScreen({
     const onKey = (e: KeyboardEvent) => {
       if (e.key !== "Escape") return;
       if (actionFor) setActionFor(null);
+      else if (confirmBlock) setConfirmBlock(false);
+      else if (headMenu) setHeadMenu(false);
       else if (forwarding) setForwarding(null);
       else if (viewer) setViewer(null);
       else if (emojiOpen) setEmojiOpen(false);
+      else if (editing) cancelEdit();
       else if (replyTo) setReplyTo(null);
       else onBack();
     };
     document.addEventListener("keydown", onKey);
     return () => document.removeEventListener("keydown", onKey);
-  }, [onBack, emojiOpen, viewer, actionFor, forwarding, replyTo]);
+  }, [onBack, emojiOpen, viewer, actionFor, forwarding, replyTo, confirmBlock, headMenu, editing]);
+
+  // Stop editing if that message was deleted meanwhile.
+  useEffect(() => {
+    if (editing && !messages.some((m) => m.id === editing.id && !m.deleted)) cancelEdit();
+  }, [messages, editing]);
+
+  /** Blocks or unblocks this contact. It happens on this device only; they aren't told. */
+  async function changeBlocked(value: boolean) {
+    setConfirmBlock(false);
+    setHeadMenu(false);
+    const chat = await import("@/lib/p2p/chat");
+    await chat.setBlocked(identity, contact.peerId, value);
+    setBlocked(value);
+    if (value) {
+      setReplyTo(null);
+      setEmojiOpen(false);
+    } else {
+      setPresence("connecting");
+      setPresence((await chat.connectTo(contact.peerId)) ? "online" : "offline");
+    }
+  }
 
   // A short confirmation ("Forwarded to …") clears by itself.
   useEffect(() => {
@@ -297,7 +348,7 @@ export default function ChatScreen({
 
   async function startForward(m: ChatMessage) {
     setActionFor(null);
-    setForwardTargets(await listContacts(identity.peerId));
+    setForwardTargets((await listContacts(identity.peerId)).filter((c) => !c.blocked));
     setForwarding(m);
   }
 
@@ -325,12 +376,43 @@ export default function ChatScreen({
 
   const authorOf = (id: string) => (id.startsWith(`${identity.peerId}:`) ? "You" : contact.handle);
 
+  /** Puts one of the user's own messages into the message box to change it. */
+  function startEdit(m: ChatMessage) {
+    setActionFor(null);
+    setReplyTo(null);
+    setPhoto(null);
+    setDoc(null);
+    setEditing(m);
+    setText(m.text);
+    requestAnimationFrame(() => {
+      inputRef.current?.focus();
+      inputRef.current?.setSelectionRange(m.text.length, m.text.length);
+    });
+  }
+
+  function cancelEdit() {
+    setEditing(null);
+    setText("");
+  }
+
   async function send() {
     const value = text.trim();
+    if (editing) {
+      setError(null);
+      try {
+        const chat = await import("@/lib/p2p/chat");
+        await chat.editMessage(identity, editing, value);
+        cancelEdit();
+      } catch (err) {
+        setError(err instanceof Error ? err.message : "Couldn't edit the message.");
+      }
+      return;
+    }
     if ((!value && !photo && !doc) || preparing) return;
     setError(null);
     try {
-      const { sendMessage } = await import("@/lib/p2p/chat");
+      const { sendMessage, resetTyping } = await import("@/lib/p2p/chat");
+      resetTyping(contact.peerId);
       if (doc) {
         // Fingerprint the file so the receiver can check it arrived intact.
         setPreparing(true);
@@ -367,11 +449,14 @@ export default function ChatScreen({
     }
   }
 
-  const presenceText =
-    network.state !== "online"
+  const presenceText = blocked
+    ? "blocked"
+    : network.state !== "online"
       ? "Connecting to the NodeX network…"
       : presence === "online"
-        ? "online"
+        ? typing
+          ? "typing…"
+          : "online"
         : presence === "connecting"
           ? "connecting…"
           : lastSeen
@@ -387,9 +472,59 @@ export default function ChatScreen({
         <Avatar name={contact.handle} size={38} src={avatarUrl} />
         <div className="chat-head">
           <span className="chat-head-name">{contact.handle}</span>
-          <span className="chat-head-status" data-presence={presence} aria-live="polite">
+          <span className="chat-head-status" data-presence={blocked ? "blocked" : presence} aria-live="polite">
             {presenceText}
           </span>
+        </div>
+        <div className="menu">
+          <button
+            type="button"
+            className="icon-btn"
+            aria-label="Chat options"
+            aria-haspopup="menu"
+            aria-expanded={headMenu}
+            onClick={() => setHeadMenu((o) => !o)}
+          >
+            <MoreIcon />
+          </button>
+          {headMenu && (
+            <div className="menu-pop" role="menu">
+              {unsaved && !blocked && (
+                <button
+                  type="button"
+                  role="menuitem"
+                  className="menu-item"
+                  onClick={async () => {
+                    setHeadMenu(false);
+                    await addContact(identity.peerId, { peerId: contact.peerId, handle: contact.handle });
+                    setUnsaved(false);
+                    setNotice(`${contact.handle} added to your contacts`);
+                    // They may now be allowed to see your photo.
+                    void import("@/lib/p2p/profile-share").then((p) => p.pushAvatar(identity));
+                  }}
+                >
+                  Add to contacts
+                </button>
+              )}
+              {blocked ? (
+                <button type="button" role="menuitem" className="menu-item" onClick={() => void changeBlocked(false)}>
+                  Unblock
+                </button>
+              ) : (
+                <button
+                  type="button"
+                  role="menuitem"
+                  className="menu-item menu-item-danger"
+                  onClick={() => {
+                    setHeadMenu(false);
+                    setConfirmBlock(true);
+                  }}
+                >
+                  Block
+                </button>
+              )}
+            </div>
+          )}
         </div>
       </header>
 
@@ -444,6 +579,7 @@ export default function ChatScreen({
                   </span>
                 )}
                 <span className="bubble-meta">
+                  {m.editedAt && !m.deleted && <span className="bubble-edited">edited</span>}
                   {timeLabel(m.sentAt)}
                   {m.direction === "out" && !m.deleted && <MessageTick status={m.status} />}
                 </span>
@@ -462,6 +598,17 @@ export default function ChatScreen({
         <p className="search-hint" role="status">
           {notice}
         </p>
+      )}
+      {editing && (
+        <div className="reply-bar">
+          <div className="bubble-quote">
+            <strong>Editing message</strong>
+            <span>{messagePreview(editing)}</span>
+          </div>
+          <button type="button" className="icon-btn icon-btn-sm" aria-label="Cancel editing" onClick={cancelEdit}>
+            <CloseIcon size={18} />
+          </button>
+        </div>
       )}
       {replyTo && (
         <div className="reply-bar">
@@ -505,9 +652,18 @@ export default function ChatScreen({
           )}
         </div>
       )}
-      {emojiOpen && <EmojiPicker onPick={insertEmoji} />}
+      {emojiOpen && !blocked && <EmojiPicker onPick={insertEmoji} />}
+      {blocked && (
+        <div className="blocked-bar" role="status">
+          <span>You blocked this contact. They can&apos;t message you.</span>
+          <button type="button" className="link-btn" onClick={() => void changeBlocked(false)}>
+            Unblock
+          </button>
+        </div>
+      )}
       <form
         className="composer"
+        hidden={blocked}
         onSubmit={(e) => {
           e.preventDefault();
           void send();
@@ -518,6 +674,7 @@ export default function ChatScreen({
           className="emoji-toggle"
           aria-label="Attach a photo, video or document"
           title="Attach a photo, video or document"
+          hidden={!!editing}
           onClick={() => fileRef.current?.click()}
         >
           <AttachIcon size={22} />
@@ -553,11 +710,18 @@ export default function ChatScreen({
           rows={1}
           autoFocus
           maxLength={MAX_MESSAGE_LENGTH}
-          placeholder={photo || doc ? "Add a caption…" : "Message"}
+          placeholder={editing ? "Edit message" : photo || doc ? "Add a caption…" : "Message"}
           value={text}
-          onChange={(e) => setText(e.target.value)}
+          onChange={(e) => {
+            setText(e.target.value);
+            // Let them see "typing…" (only over an open connection; nothing is stored).
+            if (e.target.value.trim() && !editing) {
+              void import("@/lib/p2p/chat").then((c) => c.sendTyping(contact.peerId));
+            }
+          }}
           onPaste={(e) => {
             // Pasting an image (e.g. a screenshot) attaches it as a photo.
+            if (editing) return;
             const item = [...e.clipboardData.items].find((i) => i.type.startsWith("image/"));
             if (item) {
               e.preventDefault();
@@ -571,10 +735,42 @@ export default function ChatScreen({
             }
           }}
         />
-        <button type="submit" className="send-btn" aria-label="Send" disabled={(!text.trim() && !photo && !doc) || preparing}>
+        <button
+          type="submit"
+          className="send-btn"
+          aria-label={editing ? "Save edit" : "Send"}
+          disabled={editing ? !text.trim() && !editing.image && !editing.file : (!text.trim() && !photo && !doc) || preparing}
+        >
           <SendIcon size={22} />
         </button>
       </form>
+
+      {confirmBlock && (
+        <div className="dialog-backdrop" role="presentation" onClick={() => setConfirmBlock(false)}>
+          <div
+            className="dialog"
+            role="alertdialog"
+            aria-modal="true"
+            aria-labelledby="block-title"
+            aria-describedby="block-desc"
+            onClick={(e) => e.stopPropagation()}
+          >
+            <h2 id="block-title">Block {contact.handle}?</h2>
+            <p id="block-desc">
+              They won&apos;t be able to message you, get your profile photo, or see when you&apos;re online. They won&apos;t be
+              told. You can unblock them at any time.
+            </p>
+            <div className="dialog-actions">
+              <button type="button" className="link-btn" autoFocus onClick={() => setConfirmBlock(false)}>
+                Cancel
+              </button>
+              <button type="button" className="btn btn-danger" onClick={() => void changeBlocked(true)}>
+                Block
+              </button>
+            </div>
+          </div>
+        </div>
+      )}
 
       {actionFor && (
         <div className="dialog-backdrop" role="presentation" onClick={() => setActionFor(null)}>
@@ -595,6 +791,11 @@ export default function ChatScreen({
                 {(!actionFor.file || actionFor.file.blob) && (
                   <button type="button" className="menu-item" onClick={() => void startForward(actionFor)}>
                     ↪ Forward
+                  </button>
+                )}
+                {actionFor.direction === "out" && !blocked && (
+                  <button type="button" className="menu-item" onClick={() => startEdit(actionFor)}>
+                    ✏️ Edit
                   </button>
                 )}
               </>

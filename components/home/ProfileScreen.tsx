@@ -2,7 +2,13 @@
 
 import { useEffect, useRef, useState } from "react";
 import type { StoredIdentity } from "@/lib/keystore";
-import { removeAvatar, setAvatar } from "@/lib/profile";
+import {
+  getPhotoVisibility,
+  removeAvatar,
+  setAvatar,
+  setPhotoVisibility,
+  type PhotoVisibility,
+} from "@/lib/profile";
 import Avatar from "./Avatar";
 import { BackIcon, CameraIcon } from "./icons";
 
@@ -22,6 +28,18 @@ export default function ProfileScreen({
   const [busy, setBusy] = useState(false);
   const [error, setError] = useState<string | null>(null);
   const [copied, setCopied] = useState(false);
+  const [visibility, setVisibility] = useState<PhotoVisibility>("everyone");
+
+  useEffect(() => {
+    void getPhotoVisibility(identity.peerId).then(setVisibility);
+  }, [identity.peerId]);
+
+  async function changeVisibility(v: PhotoVisibility) {
+    setVisibility(v);
+    await setPhotoVisibility(identity.peerId, v);
+    // Tell everyone connected right now: allowed people get the photo, others "no photo".
+    void import("@/lib/p2p/profile-share").then((p) => p.pushAvatar(identity));
+  }
 
   useEffect(() => {
     const onKey = (e: KeyboardEvent) => e.key === "Escape" && onBack();
@@ -122,9 +140,35 @@ export default function ProfileScreen({
           </div>
         </dl>
         <p className="hint profile-note">
-          This is your username/handle. Share it so people can find you on NodeX. Your photo is visible to people who
-          find or chat with you: it&apos;s sent straight from your device to theirs, never to a server.
+          This is your username/handle. Share it so people can find you on NodeX.
         </p>
+
+        <fieldset className="profile-privacy">
+          <legend>Who can see my profile photo</legend>
+          <label>
+            <input
+              type="radio"
+              name="photo-visibility"
+              checked={visibility === "everyone"}
+              onChange={() => void changeVisibility("everyone")}
+            />
+            Everyone who finds or chats with me
+          </label>
+          <label>
+            <input
+              type="radio"
+              name="photo-visibility"
+              checked={visibility === "contacts"}
+              onChange={() => void changeVisibility("contacts")}
+            />
+            My contacts only
+          </label>
+          <span className="hint">
+            {visibility === "contacts"
+              ? "Only people you added yourself get your photo. People who just messaged you don't."
+              : "Your photo goes straight from your device to theirs, never to a server."}
+          </span>
+        </fieldset>
       </div>
     </>
   );

@@ -85,7 +85,25 @@ export type ChatMessage = {
   deleted?: boolean;
   /** Outgoing deleted messages: whether the other device has been told. */
   deleteSent?: boolean;
+  /** When the text was last edited (the sender's clock); shown as "edited". */
+  editedAt?: number;
+  /** Outgoing edited messages: whether the other device has the latest edit. */
+  editSent?: boolean;
 };
+
+/** Edited outgoing messages whose latest text the other device doesn't have yet. */
+export async function listUnsentEdits(ownerPeerId: string, peerId?: string): Promise<ChatMessage[]> {
+  const all = await withStore(STORES.messages, "readonly", (s) => s.getAll() as IDBRequest<ChatMessage[]>);
+  return all.filter(
+    (m) =>
+      m.ownerPeerId === ownerPeerId &&
+      (!peerId || m.peerId === peerId) &&
+      m.direction === "out" &&
+      !m.deleted &&
+      m.editedAt !== undefined &&
+      m.editSent === false,
+  );
+}
 
 export const MAX_PREVIEW_LENGTH = 120;
 

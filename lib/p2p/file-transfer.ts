@@ -18,6 +18,7 @@ import { lpStream } from "@libp2p/utils";
 import type { StoredIdentity } from "../keystore";
 import { AUTO_DOWNLOAD_BYTES, getMessage, MAX_FILE_BYTES, saveMessage, type ChatMessage } from "../messages";
 import { sha256Hex } from "../profile";
+import { isBlocked } from "./blocklist";
 import { notifyMessageUpdated, onChatEvent } from "./chat";
 import { getNode, onNodeStart, openPeerStream } from "./node";
 
@@ -67,6 +68,7 @@ function report(s: TransferState) {
 async function serve(stream: Stream, connection: Connection, identity: StoredIdentity) {
   const lp = lpStream(stream, { maxDataLength: MAX_FRAME_BYTES });
   try {
+    if (isBlocked(connection.remotePeer.toString())) throw new Error("blocked");
     const req = JSON.parse(
       dec.decode((await lp.read({ signal: AbortSignal.timeout(IO_TIMEOUT_MS) })).subarray()),
     ) as GetFrame;

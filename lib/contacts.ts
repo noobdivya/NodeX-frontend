@@ -16,7 +16,29 @@ export type Contact = {
    * here, from this device's own connections; no server tracks it.
    */
   lastSeen?: number;
+  /**
+   * Blocked by this user: this device refuses their connections, messages,
+   * file and photo requests. Kept only here; nobody else is told.
+   */
+  blocked?: boolean;
+  /**
+   * Added automatically because they messaged this user, not saved by the
+   * user. Such people don't count as "my contacts" (e.g. for photo privacy).
+   */
+  auto?: boolean;
 };
+
+/** People this user saved themselves (not just people who messaged them). */
+export async function isSavedContact(ownerPeerId: string, peerId: string): Promise<boolean> {
+  const c = await getContact(ownerPeerId, peerId);
+  return !!c && !c.auto;
+}
+
+export async function setContactBlocked(ownerPeerId: string, peerId: string, blocked: boolean): Promise<void> {
+  const contact = await getContact(ownerPeerId, peerId);
+  if (!contact) return;
+  await withStore(STORES.contacts, "readwrite", (s) => s.put({ ...contact, blocked }));
+}
 
 export async function getContact(ownerPeerId: string, peerId: string): Promise<Contact | undefined> {
   return withStore(
@@ -49,10 +71,17 @@ export async function findContactByHandle(ownerPeerId: string, handle: string): 
   return (await listContacts(ownerPeerId)).find((c) => c.handleKey === key);
 }
 
-export async function addContact(ownerPeerId: string, contact: { peerId: string; handle: string }): Promise<void> {
+export async function addContact(
+  ownerPeerId: string,
+  contact: { peerId: string; handle: string; auto?: boolean },
+): Promise<void> {
   const handleKey = normalizeHandle(contact.handle);
   if (!handleKey) throw new Error("Invalid handle.");
-  const record: Contact = { ownerPeerId, ...contact, handleKey, addedAt: new Date().toISOString() };
+  // Re-adding keeps what this device already knows about them (last seen, blocked).
+  const existing = await getContact(ownerPeerId, contact.peerId);
+  const record: Contact = { ...existing, ownerPeerId, ...contact, handleKey, addedAt: new Date().toISOString() };
+  // Saving someone yourself makes them a real contact.
+  if (!contact.auto) delete record.auto;
   await withStore(STORES.contacts, "readwrite", (s) => s.put(record));
 }
 

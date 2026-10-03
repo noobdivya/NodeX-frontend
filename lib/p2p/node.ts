@@ -11,7 +11,7 @@ import { bootstrap } from "@libp2p/bootstrap";
 import { circuitRelayTransport } from "@libp2p/circuit-relay-v2";
 import { privateKeyFromProtobuf } from "@libp2p/crypto/keys";
 import { identify } from "@libp2p/identify";
-import type { Libp2p } from "@libp2p/interface";
+import type { Libp2p, PeerId } from "@libp2p/interface";
 import type { Multiaddr } from "@multiformats/multiaddr";
 import { kadDHT, passthroughMapper, type KadDHT } from "@libp2p/kad-dht";
 import { peerIdFromString } from "@libp2p/peer-id";
@@ -22,6 +22,7 @@ import { webSockets } from "@libp2p/websockets";
 import { createLibp2p } from "libp2p";
 import { normalizeHandle } from "../handle";
 import { unlockPrivateKey, type StoredIdentity } from "../keystore";
+import { isBlocked } from "./blocklist";
 import { createRecord, recordKey, RECORD_NAMESPACE, selectRecord, validateRecord } from "./record";
 
 const DHT_PROTOCOL = "/nodex/kad/1.0.0";
@@ -95,6 +96,11 @@ function makeGater() {
       if (full.includes("/p2p-circuit") && nodes.some((n) => full.startsWith(n + "/p2p/"))) return false;
       return !/\/(wss|tls(\/sni\/[^/]+)?\/ws)(\/|$)/.test(s);
     },
+    // Blocked people can't connect to this device, and it doesn't connect to them.
+    denyDialPeer: (peerId: PeerId) => isBlocked(peerId.toString()),
+    denyInboundEncryptedConnection: (peerId: PeerId) => isBlocked(peerId.toString()),
+    denyInboundUpgradedConnection: (peerId: PeerId) => isBlocked(peerId.toString()),
+    denyOutboundUpgradedConnection: (peerId: PeerId) => isBlocked(peerId.toString()),
   };
 }
 

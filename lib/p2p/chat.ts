@@ -27,6 +27,7 @@ import {
   getMessage,
   listPending,
   listUnsentDeletes,
+  listUnsentEdits,
   listUnsentReceipts,
   MAX_FILE_BYTES,
   MAX_MESSAGE_LENGTH,
@@ -38,6 +39,7 @@ import {
   type ChatMessage,
 } from "../messages";
 import { sha256Hex } from "../profile";
+import { isBlocked, loadBlocked, storeBlocked } from "./blocklist";
 import { getNode, lookupHandle, onNodeStart, openPeerStream, peerAddresses, type Node } from "./node";
 import { magicMatches } from "./profile-share";
 
@@ -82,7 +84,17 @@ type ReplyInfo = { id: string; mine: boolean; preview: string };
 type ReadFrame = { t: "read"; ids: string[] };
 /** "Delete for everyone": the sender's own messages to remove on the other device. */
 type DelFrame = { t: "del"; ids: string[] };
+/** Edits to the sender's own messages; `at` lets the newest edit win. */
+type EditFrame = { t: "edit"; items: { id: string; text: string; at: number }[] };
+/** "I'm typing": shown for a few seconds, never stored or queued. */
+type TypingFrame = { t: "typing" };
 type AckFrame = { t: "ack"; id: string };
+
+const MAX_EDITS_PER_FRAME = 50;
+/** How long "typing…" stays without a new signal. */
+export const TYPING_SHOW_MS = 5_000;
+/** At most one typing signal per conversation this often. */
+const TYPING_SEND_EVERY_MS = 3_000;
 
 const FRAME_ID_RE = /^[A-Za-z0-9-]{8,64}$/;
 const MAX_RECEIPT_IDS = 500;
@@ -92,7 +104,11 @@ export type ChatEvent =
   | { type: "status"; message: ChatMessage }
   | { type: "presence"; peerId: string; online: boolean }
   /** Messages in these conversations disappeared (48 h after being read). */
-  | { type: "deleted"; peerIds: string[] };
+  | { type: "deleted"; peerIds: string[] }
+  /** This user just read the conversation with `peerId` (unread counts changed). */
+  | { type: "read"; peerId: string }
+  /** `peerId` is typing a message to this user right now. */
+  | { type: "typing"; peerId: string };
 
 const listeners = new Set<(e: ChatEvent) => void>();
 export function onChatEvent(listener: (e: ChatEvent) => void): () => void {
@@ -111,6 +127,7 @@ const inFlight = new Set<string>();
 // ---------------------------------------------------------------- receiving
 
 onNodeStart(async (node, identity) => {
+  await loadBlocked(identity.peerId);
   await node.handle(CHAT_PROTOCOL, (stream, connection) => void receive(stream, connection, identity), {
     runOnLimitedConnection: true,
     maxInboundStreams: 64,
@@ -228,6 +245,44 @@ function isReplyInfo(r: unknown): r is ReplyInfo {
   );
 }
 
+function isEditFrame(f: unknown): f is EditFrame {
+  const e = f as EditFrame;
+  return (
+    !!e &&
+    e.t === "edit" &&
+    Array.isArray(e.items) &&
+    e.items.length > 0 &&
+    e.items.length <= MAX_EDITS_PER_FRAME &&
+    e.items.every(
+      (i) =>
+        !!i &&
+        typeof i.id === "string" &&
+        FRAME_ID_RE.test(i.id) &&
+        typeof i.text === "string" &&
+        i.text.length <= MAX_MESSAGE_LENGTH &&
+        Number.isSafeInteger(i.at),
+    )
+  );
+}
+
+/**
+ * Applies edits from `from`: only messages `from` wrote themselves can be
+ * changed, deleted messages stay deleted, and an older edit never replaces
+ * a newer one.
+ */
+async function applyEdits(identity: StoredIdentity, from: string, frame: EditFrame) {
+  for (const item of frame.items) {
+    const m = await getMessage(`${from}:${item.id}`);
+    if (!m || m.ownerPeerId !== identity.peerId || m.direction !== "in" || m.peerId !== from || m.deleted) continue;
+    if ((m.editedAt ?? 0) >= item.at) continue;
+    const text = item.text.trim();
+    if (!text && !m.image && !m.file) continue; // a text message can't become empty
+    const edited: ChatMessage = { ...m, text, editedAt: item.at };
+    await saveMessage(edited);
+    emit({ type: "status", message: edited });
+  }
+}
+
 function isDelFrame(f: unknown): f is DelFrame {
   const d = f as DelFrame;
   return (
@@ -312,8 +367,23 @@ async function receive(stream: Stream, connection: Connection, identity: StoredI
     const frame = parseFrame<unknown>((await lp.read({ signal: AbortSignal.timeout(IO_TIMEOUT_MS) })).subarray());
     // The connection is authenticated: remotePeer is cryptographically proven.
     const from = connection.remotePeer.toString();
+    // Nothing is accepted from someone this user blocked; they get no reply.
+    if (isBlocked(from)) throw new Error("blocked");
     void touchLastSeen(identity.peerId, from).catch(() => {});
 
+    if ((frame as TypingFrame)?.t === "typing") {
+      emit({ type: "typing", peerId: from });
+      await stream.close();
+      return;
+    }
+    if (isEditFrame(frame)) {
+      await applyEdits(identity, from, frame);
+      await lp.write(enc.encode(JSON.stringify({ t: "ack", id: "edit" } satisfies AckFrame)), {
+        signal: AbortSignal.timeout(IO_TIMEOUT_MS),
+      });
+      await stream.close();
+      return;
+    }
     if (isDelFrame(frame)) {
       await applyDelete(identity, from, frame);
       await lp.write(enc.encode(JSON.stringify({ t: "ack", id: "del" } satisfies AckFrame)), {
@@ -378,7 +448,7 @@ async function receive(stream: Stream, connection: Connection, identity: StoredI
       await saveMessage(message);
       // People who message you appear in your chats.
       if (!(await listContacts(identity.peerId)).some((c) => c.peerId === from)) {
-        await addContact(identity.peerId, { peerId: from, handle });
+        await addContact(identity.peerId, { peerId: from, handle, auto: true });
       }
       emit({ type: "message", message });
     }
@@ -511,6 +581,45 @@ async function sendReceipts(identity: StoredIdentity, peerId: string): Promise<b
 }
 
 /** Tells `peerId` which of this user's messages were deleted for everyone; true once acknowledged. */
+/** Sends this user's edits that `peerId` hasn't received yet; true once acknowledged. */
+async function sendEdits(identity: StoredIdentity, peerId: string): Promise<boolean> {
+  const due = await listUnsentEdits(identity.peerId, peerId);
+  if (due.length === 0) return true;
+  const nodePromise = getNode();
+  if (!nodePromise) return false;
+  let stream: Stream | undefined;
+  try {
+    const node = await nodePromise;
+    stream = await openStream(node, peerId);
+    const lp = lpStream(stream, { maxDataLength: MAX_FRAME_BYTES });
+    // Long texts make big frames: send a few at a time.
+    const batch: ChatMessage[] = [];
+    let bytes = 0;
+    for (const m of due) {
+      if (batch.length >= MAX_EDITS_PER_FRAME || bytes + m.text.length * 4 > MAX_JSON_BYTES - 1024) break;
+      batch.push(m);
+      bytes += m.text.length * 4 + 100;
+    }
+    const frame: EditFrame = {
+      t: "edit",
+      items: batch.map((m) => ({ id: m.id.slice(m.id.indexOf(":") + 1), text: m.text, at: m.editedAt! })),
+    };
+    await lp.write(enc.encode(JSON.stringify(frame)), { signal: AbortSignal.timeout(IO_TIMEOUT_MS) });
+    const ack = parseFrame<AckFrame>((await lp.read({ signal: AbortSignal.timeout(IO_TIMEOUT_MS) })).subarray());
+    if (ack.t !== "ack" || ack.id !== "edit") throw new Error("bad edit ack");
+    await stream.close().catch(() => {});
+    for (const m of batch) {
+      const current = await getMessage(m.id);
+      // Only mark it sent if it wasn't edited again meanwhile.
+      if (current && current.editedAt === m.editedAt) await saveMessage({ ...current, editSent: true });
+    }
+    return batch.length === due.length;
+  } catch {
+    stream?.abort(new Error("edit failed"));
+    return false;
+  }
+}
+
 async function sendDeletes(identity: StoredIdentity, peerId: string): Promise<boolean> {
   const due = await listUnsentDeletes(identity.peerId, peerId);
   if (due.length === 0) return true;
@@ -543,13 +652,17 @@ const peerQueues = new Map<string, Promise<void>>();
 
 function flushPeer(identity: StoredIdentity, peerId: string): Promise<void> {
   const run = (peerQueues.get(peerId) ?? Promise.resolve()).then(async () => {
+    if (isBlocked(peerId)) return;
     // Re-read inside the queue so messages sent meanwhile are included.
     const queue = (await listPending(identity.peerId)).filter((m) => m.peerId === peerId);
-    for (const m of queue) {
-      if (!(await getMessage(m.id))) continue; // deleted while waiting
+    for (const queued of queue) {
+      // Re-read: it may have been deleted or edited while waiting.
+      const m = await getMessage(queued.id);
+      if (!m || m.status !== "pending") continue;
       if (!(await deliver(identity, m))) return; // keep order; retry later
     }
     await sendReceipts(identity, peerId);
+    await sendEdits(identity, peerId);
     await sendDeletes(identity, peerId);
   });
   const settled = run.catch(() => {});
@@ -567,6 +680,7 @@ async function flushOutbox(identity: StoredIdentity, onlyPeer?: string) {
     ...(await listPending(identity.peerId)).map((m) => m.peerId),
     ...(await listUnsentReceipts(identity.peerId)).map((m) => m.peerId),
     ...(await listUnsentDeletes(identity.peerId)).map((m) => m.peerId),
+    ...(await listUnsentEdits(identity.peerId)).map((m) => m.peerId),
   ]);
   await Promise.all([...peers].map((p) => flushPeer(identity, p)));
 }
@@ -584,6 +698,7 @@ export async function purgeExpired(identity: StoredIdentity): Promise<void> {
 
 /** Call after the user has read a conversation: sends the read receipts. */
 export function notifyRead(identity: StoredIdentity, peerId: string): void {
+  emit({ type: "read", peerId });
   void flushPeer(identity, peerId);
 }
 
@@ -600,6 +715,7 @@ export async function sendMessage(
   extra: { replyTo?: ChatMessage; forwarded?: boolean } = {},
 ): Promise<ChatMessage> {
   const trimmed = text.trim();
+  if (isBlocked(peerId)) throw new Error("You blocked this contact. Unblock them to send messages.");
   if (!trimmed && !image && !file) throw new Error("Message is empty.");
   if (trimmed.length > MAX_MESSAGE_LENGTH) throw new Error(`Messages can be up to ${MAX_MESSAGE_LENGTH} characters.`);
   if (image && (!IMAGE_TYPES.includes(image.blob.type) || image.blob.size > MAX_IMAGE_BYTES)) {
@@ -639,6 +755,59 @@ export async function deleteForMe(message: ChatMessage): Promise<void> {
  * Removes one of this user's own messages from both devices. The other
  * device is told directly; if it's offline, as soon as it's reachable.
  */
+/**
+ * Changes the text (or caption) of one of this user's messages on both
+ * devices. A message still waiting on this device is simply changed; a
+ * delivered one is marked "edited" and the change is sent to the other
+ * device (now, or as soon as it's reachable).
+ */
+export async function editMessage(identity: StoredIdentity, message: ChatMessage, newText: string): Promise<void> {
+  if (message.direction !== "out" || message.ownerPeerId !== identity.peerId) return;
+  const current = await getMessage(message.id);
+  if (!current || current.deleted) throw new Error("This message can no longer be edited.");
+  const text = newText.trim();
+  if (text.length > MAX_MESSAGE_LENGTH) throw new Error(`Messages can be up to ${MAX_MESSAGE_LENGTH} characters.`);
+  if (!text && !current.image && !current.file) throw new Error("A message can't be empty. Delete it instead.");
+  if (text === current.text) return;
+  const updated: ChatMessage =
+    current.status === "pending" && !inFlight.has(current.id)
+      ? { ...current, text }
+      : { ...current, text, editedAt: Math.max(Date.now(), (current.editedAt ?? 0) + 1), editSent: false };
+  await saveMessage(updated);
+  emit({ type: "status", message: updated });
+  void flushOutbox(identity, message.peerId);
+}
+
+const lastTypingSent = new Map<string, number>();
+
+/**
+ * Tells `peerId` that this user is typing. Only over a connection that's
+ * already open, at most every few seconds, and never stored or queued.
+ */
+export async function sendTyping(peerId: string): Promise<void> {
+  const now = Date.now();
+  if (isBlocked(peerId) || now - (lastTypingSent.get(peerId) ?? 0) < TYPING_SEND_EVERY_MS) return;
+  const node = await getNode()?.catch(() => null);
+  if (!node || node.getConnections(peerIdFromString(peerId)).length === 0) return;
+  lastTypingSent.set(peerId, now);
+  let stream: Stream | undefined;
+  try {
+    stream = await openStream(node, peerId);
+    const lp = lpStream(stream, { maxDataLength: MAX_FRAME_BYTES });
+    await lp.write(enc.encode(JSON.stringify({ t: "typing" } satisfies TypingFrame)), {
+      signal: AbortSignal.timeout(IO_TIMEOUT_MS),
+    });
+    await stream.close().catch(() => {});
+  } catch {
+    stream?.abort(new Error("typing signal failed"));
+  }
+}
+
+/** Call after sending, so the next keystroke signals "typing" again straight away. */
+export function resetTyping(peerId: string): void {
+  lastTypingSent.delete(peerId);
+}
+
 export async function deleteForEveryone(identity: StoredIdentity, message: ChatMessage): Promise<void> {
   if (message.direction !== "out" || message.ownerPeerId !== identity.peerId) return;
   if (message.status === "pending" && !inFlight.has(message.id)) {
@@ -652,6 +821,22 @@ export async function deleteForEveryone(identity: StoredIdentity, message: ChatM
   void flushOutbox(identity, message.peerId);
 }
 
+/**
+ * Blocks or unblocks a contact. Blocking closes any connection to them and
+ * from then on this device refuses theirs; they are not told. Unblocking
+ * sends whatever was waiting for them.
+ */
+export async function setBlocked(identity: StoredIdentity, peerId: string, blocked: boolean): Promise<void> {
+  await storeBlocked(identity.peerId, peerId, blocked);
+  if (blocked) {
+    const node = await getNode()?.catch(() => null);
+    await node?.hangUp(peerIdFromString(peerId)).catch(() => {});
+    emit({ type: "presence", peerId, online: false });
+  } else {
+    void flushOutbox(identity, peerId);
+  }
+}
+
 /** Whether there's currently a live connection to this peer. */
 export async function isConnected(peerId: string): Promise<boolean> {
   const node = await getNode()?.catch(() => null);
@@ -661,7 +846,7 @@ export async function isConnected(peerId: string): Promise<boolean> {
 /** Tries to connect to a peer (to show presence and speed up the first message). */
 export async function connectTo(peerId: string): Promise<boolean> {
   const node = await getNode()?.catch(() => null);
-  if (!node) return false;
+  if (!node || isBlocked(peerId)) return false;
   const pid = peerIdFromString(peerId);
   if (node.getConnections(pid).length > 0) return true;
   try {

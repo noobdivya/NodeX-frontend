@@ -2,9 +2,17 @@
 
 import { useRouter } from "next/navigation";
 import { useCallback, useEffect, useRef, useState } from "react";
-import { addContact, listContacts, removeContact, type Contact } from "@/lib/contacts";
+import { addContact, getContact, listContacts, removeContact, type Contact } from "@/lib/contacts";
 import { clearIdentity, getIdentity, type StoredIdentity } from "@/lib/keystore";
-import { listConversations, messagePreview, type ConversationSummary } from "@/lib/messages";
+import { listConversations, messagePreview, type ChatMessage, type ConversationSummary } from "@/lib/messages";
+import {
+  disableNotifications,
+  enableNotifications,
+  notificationsUndecided,
+  notifyMessage,
+  notifyState,
+  type NotifyState,
+} from "@/lib/notifications";
 import type { LookupResult, NetworkStatus } from "@/lib/p2p/node";
 import { getAvatar } from "@/lib/profile";
 import Avatar from "./Avatar";
@@ -112,6 +120,36 @@ export default function HomeScreen() {
     };
   }, [router]);
 
+  // Notifications for messages that arrive while NodeX is in the background.
+  const [notify, setNotify] = useState<NotifyState>("off");
+  const [offerNotify, setOfferNotify] = useState(false);
+  useEffect(() => {
+    setNotify(notifyState());
+    setOfferNotify(notificationsUndecided());
+  }, []);
+
+  const announce = useCallback(
+    async (m: ChatMessage) => {
+      if (!identity) return;
+      const contact = await getContact(identity.peerId, m.peerId);
+      if (!contact || contact.blocked) return;
+      notifyMessage(contact.handle, messagePreview(m), m.peerId, () => {
+        setChatWith(contact);
+        setView("chat");
+      });
+    },
+    [identity],
+  );
+
+  // Unread count in the tab title, e.g. "(2) NodeX".
+  useEffect(() => {
+    // The page's own title may not be set yet on first load, hence the fallback.
+    const base = document.title.replace(/^\(\d+\)\s*/, "") || "NodeX";
+    let unread = 0;
+    for (const s of summaries.values()) unread += s.unread;
+    document.title = unread > 0 ? `(${unread}) ${base}` : base;
+  }, [summaries, view]);
+
   const refreshChats = useCallback(async () => {
     if (!identity) return;
     try {
@@ -140,6 +178,7 @@ export default function HomeScreen() {
       unsubscribeStatus = onStatus(setNetwork);
       unsubscribeChat = chat.onChatEvent((e) => {
         if (e.type !== "presence") void refreshChats();
+        if (e.type === "message" && e.message.direction === "in") void announce(e.message);
       });
       // Disappearing messages: delete anything read more than 48 hours ago.
       const purge = () => void chat.purgeExpired(identity).catch(() => {});
@@ -153,7 +192,7 @@ export default function HomeScreen() {
       unsubscribeStatus?.();
       unsubscribeChat?.();
     };
-  }, [identity, refreshChats]);
+  }, [identity, refreshChats, announce]);
 
   // Close the menu on outside click or Escape.
   useEffect(() => {
@@ -299,6 +338,24 @@ export default function HomeScreen() {
               <button type="button" role="menuitem" className="menu-item" onClick={openProfile}>
                 Profile
               </button>
+              {notify !== "unsupported" && (
+                <button
+                  type="button"
+                  role="menuitem"
+                  className="menu-item"
+                  disabled={notify === "denied"}
+                  onClick={async () => {
+                    setOfferNotify(false);
+                    setNotify(notify === "on" ? disableNotifications() : await enableNotifications());
+                  }}
+                >
+                  {notify === "on"
+                    ? "Turn off notifications"
+                    : notify === "denied"
+                      ? "Notifications are blocked in your browser settings"
+                      : "Turn on notifications"}
+                </button>
+              )}
               <button
                 type="button"
                 role="menuitem"
@@ -321,6 +378,33 @@ export default function HomeScreen() {
         <span className="net-dot" aria-hidden="true" />
         {networkLabel(network)}
       </p>
+      {offerNotify && (
+        <p className="notify-banner">
+          <span>Get notified about new messages while NodeX is open in the background.</span>
+          <span>
+            <button
+              type="button"
+              className="link-btn"
+              onClick={async () => {
+                setOfferNotify(false);
+                setNotify(await enableNotifications());
+              }}
+            >
+              Turn on
+            </button>
+            <button
+              type="button"
+              className="link-btn"
+              onClick={() => {
+                setOfferNotify(false);
+                setNotify(disableNotifications());
+              }}
+            >
+              Not now
+            </button>
+          </span>
+        </p>
+      )}
       {loadError && (
         <p className="search-hint" data-tone="error" role="alert">
           Some local data couldn&apos;t be loaded: {loadError}
@@ -371,6 +455,7 @@ export default function HomeScreen() {
                         )}
                       </span>
                     </div>
+                    {c.blocked && <span className="chat-blocked">Blocked</span>}
                     {s && (
                       <div className="chat-side">
                         <span className="chat-time" data-unread={s.unread > 0}>

@@ -6,15 +6,17 @@
 //   push:   owner → { t: "photo", ... } + <bytes>  |  { t: "none" }      (when the photo changes)
 //           receiver → { t: "ok" }
 //
-// Anyone who connects can fetch your photo (like "Everyone" in WhatsApp);
-// unsolicited pushes are accepted only from your contacts. Every photo is
+// Who can fetch your photo is your choice: "Everyone" (anyone who connects)
+// or "My contacts" (only people you saved; everyone else is answered
+// "none"). Unsolicited pushes are accepted only from your contacts. Every photo is
 // checked: allowed image type, ≤ 256 KB, matching magic bytes and SHA-256.
 import type { Connection, Stream } from "@libp2p/interface";
 import { peerIdFromString } from "@libp2p/peer-id";
 import { lpStream } from "@libp2p/utils";
-import { listContacts } from "../contacts";
+import { isSavedContact, listContacts } from "../contacts";
 import type { StoredIdentity } from "../keystore";
-import { getProfile, removeAvatar, setAvatar, sha256Hex } from "../profile";
+import { getProfile, removeAvatar, setAvatar, sha256Hex, type PhotoVisibility } from "../profile";
+import { isBlocked } from "./blocklist";
 import { BOOTSTRAP_PEERS, getNode, onNodeStart, openPeerStream } from "./node";
 
 export const PROFILE_PROTOCOL = "/nodex/profile/1.0.0";
@@ -70,9 +72,17 @@ async function readPhoto(lp: ReturnType<typeof lpStream>, h: Extract<Header, { t
   return new Blob([bytes], { type: h.type });
 }
 
-async function sendOwnPhoto(lp: ReturnType<typeof lpStream>, identity: StoredIdentity, have: string | null) {
+/** Whether `peerId` may have this user's photo ("Everyone", or "My contacts" and saved by this user). */
+async function maySeePhoto(identity: StoredIdentity, peerId: string, visibility: PhotoVisibility | undefined) {
+  return (visibility ?? "everyone") === "everyone" || (await isSavedContact(identity.peerId, peerId));
+}
+
+async function sendOwnPhoto(lp: ReturnType<typeof lpStream>, identity: StoredIdentity, to: string, have: string | null) {
   const own = await getProfile(identity.peerId);
-  if (!own?.avatar || !own.hash) return writeHeader(lp, { t: "none" });
+  // Someone not allowed to see it is told there is no photo.
+  if (!own?.avatar || !own.hash || !(await maySeePhoto(identity, to, own.photoVisibility))) {
+    return writeHeader(lp, { t: "none" });
+  }
   if (have && have === own.hash) return writeHeader(lp, { t: "same" });
   const bytes = new Uint8Array(await own.avatar.arrayBuffer());
   await writeHeader(lp, { t: "photo", hash: own.hash, type: own.avatar.type, size: bytes.length });
@@ -89,9 +99,10 @@ async function handle(stream: Stream, connection: Connection, identity: StoredId
   const lp = lpStream(stream, { maxDataLength: MAX_FRAME_BYTES });
   const from = connection.remotePeer.toString();
   try {
+    if (isBlocked(from)) throw new Error("blocked");
     const first = await readHeader(lp);
     if (first.t === "get") {
-      await sendOwnPhoto(lp, identity, typeof first.have === "string" ? first.have : null);
+      await sendOwnPhoto(lp, identity, from, typeof first.have === "string" ? first.have : null);
     } else if (first.t === "photo" || first.t === "none") {
       // A contact pushing their new photo (or its removal).
       if (!(await isContact(identity, from))) throw new Error("push from non-contact");
@@ -173,7 +184,7 @@ export async function pushAvatar(identity: StoredIdentity): Promise<void> {
         if (node.getConnections(peerIdFromString(peerId)).length === 0) return;
         stream = await openPeerStream(node, peerId, PROFILE_PROTOCOL, IO_TIMEOUT_MS);
         const lp = lpStream(stream, { maxDataLength: MAX_FRAME_BYTES });
-        await sendOwnPhoto(lp, identity, null);
+        await sendOwnPhoto(lp, identity, peerId, null);
         await readHeader(lp);
         await stream.close().catch(() => {});
       } catch {
