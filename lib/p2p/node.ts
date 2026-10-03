@@ -29,6 +29,12 @@ const DHT_PROTOCOL = "/nodex/kad/1.0.0";
 const REPUBLISH_MS = 6 * 60 * 60 * 1000;
 const LOOKUP_TIMEOUT_MS = 20_000;
 const PUBLISH_RETRY_MS = [3_000, 10_000, 30_000, 60_000];
+/** Waits between attempts to reach a NodeX node while disconnected. */
+const CONNECT_RETRY_MS = [3_000, 5_000, 10_000, 20_000, 30_000];
+/** Long enough for a sleeping hosted node to wake up and answer. */
+const CONNECT_TIMEOUT_MS = 75_000;
+/** How often to check the connection is still there. */
+const CONNECTED_CHECK_MS = 30_000;
 
 /** Nodes to join the network through (comma-separated multiaddrs). */
 export const BOOTSTRAP_PEERS = (process.env.NEXT_PUBLIC_BOOTSTRAP_PEERS ?? "")
@@ -192,9 +198,24 @@ export function startNetwork(identity: StoredIdentity): Promise<Node> {
 
     // "Online" means connected to at least one NodeX network node.
     const nodeIds = new Set(BOOTSTRAP_PEERS.map((a) => a.split("/p2p/").pop()));
+    let lastPeers = 0;
+    let everConnected = false;
     const updatePeers = () => {
       const peers = node.getPeers().filter((p) => nodeIds.has(p.toString())).length;
-      setStatus({ peers, state: peers > 0 ? "online" : "connecting" });
+      if (peers === 0) {
+        // Whatever we published may be gone by the time we're back.
+        setStatus({ peers, state: "connecting", published: false });
+      } else {
+        setStatus({ peers, state: "online" });
+        // Back after losing every node: a node that restarted (or woke from
+        // sleep) has lost the handle records it held in memory, so publish again.
+        if (lastPeers === 0 && everConnected) {
+          clearTimeout(republishTimer);
+          void publishLoop(node, identity, privateKey, 0);
+        }
+        everConnected = true;
+      }
+      lastPeers = peers;
     };
     node.addEventListener("peer:connect", updatePeers);
     node.addEventListener("peer:disconnect", updatePeers);
@@ -202,6 +223,7 @@ export function startNetwork(identity: StoredIdentity): Promise<Node> {
     updatePeers();
 
     for (const hook of onStartHooks) await hook(node, identity);
+    keepConnected(node, nodeIds);
     void publishLoop(node, identity, privateKey, 0);
     return node;
   })();
@@ -211,6 +233,37 @@ export function startNetwork(identity: StoredIdentity): Promise<Node> {
     if (current?.promise === promise) current = null;
   });
   return promise;
+}
+
+/**
+ * Stays connected to the NodeX network nodes. The first connection can fail
+ * (a hosted node may take a minute to wake up) and connections can drop (a
+ * node restarts), so keep retrying, quickly at first, and check regularly.
+ */
+function keepConnected(node: Node, nodeIds: Set<string | undefined>) {
+  let attempt = 0;
+  let timer: ReturnType<typeof setTimeout> | undefined;
+  const connected = () => node.getPeers().some((p) => nodeIds.has(p.toString()));
+  const tick = async () => {
+    if (node.status !== "started") return;
+    if (!connected()) {
+      setStatus({ state: "connecting" });
+      try {
+        await Promise.any(
+          BOOTSTRAP_PEERS.map((a) => node.dial(multiaddr(a), { signal: AbortSignal.timeout(CONNECT_TIMEOUT_MS) })),
+        );
+        attempt = 0;
+      } catch {
+        attempt++;
+      }
+    }
+    if (node.status !== "started") return;
+    const wait = connected() ? CONNECTED_CHECK_MS : CONNECT_RETRY_MS[Math.min(attempt, CONNECT_RETRY_MS.length - 1)];
+    timer = setTimeout(() => void tick(), wait);
+  };
+  // Give the built-in first dial a moment before checking.
+  timer = setTimeout(() => void tick(), CONNECT_RETRY_MS[0]);
+  node.addEventListener("stop", () => clearTimeout(timer), { once: true });
 }
 
 /** Publishes this user's handle record, retrying until a node stores it, then republishes periodically. */
