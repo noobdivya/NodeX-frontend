@@ -50,7 +50,8 @@ export default function PrivacyPage() {
 
         <h2>Your email address</h2>
         <p>
-          When you sign up, your email address is sent to the NodeX email verifier so it can email you a 6-digit code.
+          When you sign up, your email address is sent to the NodeX email verifier so it can email you a 6-digit code
+          (through Brevo, below).
           The verifier keeps no record of it beyond the few minutes the code is valid (to limit repeated requests). Your
           device keeps only a slow, salted hash of your email, which is also part of your public handle record (below).
         </p>
@@ -69,15 +70,15 @@ export default function PrivacyPage() {
           chats with you, or only to your saved contacts, as you choose in your profile.
         </p>
 
-        <h2>Google (Gmail)</h2>
+        <h2>Email delivery (Brevo)</h2>
         <p>
-          Sign-up codes are sent from NodeX&apos;s own Gmail account using the Gmail API, with permission only to send
-          email. NodeX never asks for access to your Google account and doesn&apos;t receive, read or store any data from
-          it. NodeX&apos;s use of information received from Google APIs adheres to the{" "}
-          <a href="https://developers.google.com/terms/api-services-user-data-policy" rel="noreferrer">
-            Google API Services User Data Policy
+          Sign-up codes are delivered by{" "}
+          <a href="https://www.brevo.com/legal/privacypolicy/" rel="noreferrer">
+            Brevo
           </a>
-          , including the Limited Use requirements.
+          , an email delivery service. To send your code, Brevo receives your email address and the email&apos;s
+          contents, and keeps delivery records under its own privacy policy. NodeX doesn&apos;t use Brevo for marketing
+          and doesn&apos;t add you to any mailing list. NodeX never asks for access to your email account.
         </p>
 
         <h2>Hosting providers</h2>
