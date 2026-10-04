@@ -17,7 +17,6 @@
 import type { Connection, Stream } from "@libp2p/interface";
 import { peerIdFromString } from "@libp2p/peer-id";
 import { lpStream } from "@libp2p/utils";
-import { multiaddr } from "@multiformats/multiaddr";
 import { addContact, listContacts, touchLastSeen } from "../contacts";
 import { handlesEqual } from "../handle";
 import type { StoredIdentity } from "../keystore";
@@ -40,7 +39,7 @@ import {
 } from "../messages";
 import { sha256Hex } from "../profile";
 import { isBlocked, loadBlocked, storeBlocked } from "./blocklist";
-import { getNode, lookupHandle, onNodeStart, openPeerStream, peerAddresses, type Node } from "./node";
+import { connectPeer, getNode, lookupHandle, onNodeStart, openPeerStream, type Node } from "./node";
 import { magicMatches } from "./profile-share";
 
 export const CHAT_PROTOCOL = "/nodex/chat/1.0.0";
@@ -847,13 +846,8 @@ export async function isConnected(peerId: string): Promise<boolean> {
 export async function connectTo(peerId: string): Promise<boolean> {
   const node = await getNode()?.catch(() => null);
   if (!node || isBlocked(peerId)) return false;
-  const pid = peerIdFromString(peerId);
-  if (node.getConnections(pid).length > 0) return true;
   try {
-    await node.dial(
-      peerAddresses(peerId).webrtc.map((a) => multiaddr(a)),
-      { signal: AbortSignal.timeout(DIAL_TIMEOUT_MS) },
-    );
+    await connectPeer(node, peerId, DIAL_TIMEOUT_MS);
     return true;
   } catch {
     return false;

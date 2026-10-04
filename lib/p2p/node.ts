@@ -11,7 +11,7 @@ import { bootstrap } from "@libp2p/bootstrap";
 import { circuitRelayTransport } from "@libp2p/circuit-relay-v2";
 import { privateKeyFromProtobuf } from "@libp2p/crypto/keys";
 import { identify } from "@libp2p/identify";
-import type { Libp2p, PeerId } from "@libp2p/interface";
+import type { Connection, Libp2p, PeerId } from "@libp2p/interface";
 import type { Multiaddr } from "@multiformats/multiaddr";
 import { kadDHT, passthroughMapper, type KadDHT } from "@libp2p/kad-dht";
 import { peerIdFromString } from "@libp2p/peer-id";
@@ -35,6 +35,10 @@ const CONNECT_RETRY_MS = [3_000, 5_000, 10_000, 20_000, 30_000];
 const CONNECT_TIMEOUT_MS = 75_000;
 /** How often to check the connection is still there. */
 const CONNECTED_CHECK_MS = 30_000;
+/** How long a background attempt at a direct browser-to-browser connection may take. */
+const DIRECT_TIMEOUT_MS = 20_000;
+/** After a failed direct attempt, wait this long before trying that peer again. */
+const DIRECT_RETRY_MS = 60_000;
 
 /** Nodes to join the network through (comma-separated multiaddrs). */
 export const BOOTSTRAP_PEERS = (process.env.NEXT_PUBLIC_BOOTSTRAP_PEERS ?? "")
@@ -121,30 +125,60 @@ export function peerAddresses(peerId: string): { webrtc: string[]; relayed: stri
   };
 }
 
+/** The open connection to use for a peer: a direct one if there is one, else a relayed one. */
+function bestConnection(node: Node, peerId: string): Connection | undefined {
+  const open = node.getConnections(peerIdFromString(peerId)).filter((c) => c.status === "open");
+  return open.find((c) => c.limits == null) ?? open[0];
+}
+
+/** Peers a direct connection is being tried for, and when the last try failed. */
+const upgrading = new Set<string>();
+const upgradeFailedAt = new Map<string, number>();
+
 /**
- * Opens a protocol stream to another browser: reuses an existing connection,
- * else connects via WebRTC (relay carries only the handshake), else falls
- * back to a relayed connection. Always end-to-end encrypted.
+ * Tries, in the background, to add a direct WebRTC connection to a peer
+ * reached through the relay. Nothing waits for it: between different
+ * networks it often can't be established, and the relay keeps working.
+ */
+function upgradeToDirect(node: Node, peerId: string) {
+  if (upgrading.has(peerId) || Date.now() - (upgradeFailedAt.get(peerId) ?? 0) < DIRECT_RETRY_MS) return;
+  upgrading.add(peerId);
+  node
+    .dial(
+      peerAddresses(peerId).webrtc.map((a) => multiaddr(a)),
+      { signal: AbortSignal.timeout(DIRECT_TIMEOUT_MS) },
+    )
+    .then(
+      () => upgradeFailedAt.delete(peerId),
+      () => upgradeFailedAt.set(peerId, Date.now()),
+    )
+    .finally(() => upgrading.delete(peerId));
+}
+
+/**
+ * Connects to another browser. The relay is used first because it connects
+ * within a second or two; a direct WebRTC connection is then set up in the
+ * background and takes over once it's ready. Always end-to-end encrypted.
+ */
+export async function connectPeer(node: Node, peerId: string, timeoutMs = 20_000): Promise<Connection> {
+  const connection =
+    bestConnection(node, peerId) ??
+    (await node.dial(
+      peerAddresses(peerId).relayed.map((a) => multiaddr(a)),
+      { signal: AbortSignal.timeout(timeoutMs) },
+    ));
+  if (connection.limits != null) upgradeToDirect(node, peerId);
+  return connection;
+}
+
+/**
+ * Opens a protocol stream to another browser, on the existing connection if
+ * there is one. (libp2p's own dialProtocol ignores relayed connections and
+ * would dial again for every stream, so the connection is picked here.)
  */
 export async function openPeerStream(node: Node, peerId: string, protocol: string, timeoutMs = 20_000) {
-  const pid = peerIdFromString(peerId);
-  if (node.getConnections(pid).length > 0) {
-    return node.dialProtocol(pid, protocol, { runOnLimitedConnection: true, signal: AbortSignal.timeout(timeoutMs) });
-  }
-  const addrs = peerAddresses(peerId);
-  try {
-    return await node.dialProtocol(
-      addrs.webrtc.map((a) => multiaddr(a)),
-      protocol,
-      { signal: AbortSignal.timeout(timeoutMs) },
-    );
-  } catch {
-    return node.dialProtocol(
-      addrs.relayed.map((a) => multiaddr(a)),
-      protocol,
-      { runOnLimitedConnection: true, signal: AbortSignal.timeout(timeoutMs) },
-    );
-  }
+  const connection = await connectPeer(node, peerId, timeoutMs);
+  return connection.newStream(protocol, { runOnLimitedConnection: true, signal: AbortSignal.timeout(timeoutMs) });
 }
 
 /** The running node, if any. */
@@ -315,21 +349,19 @@ export async function lookupHandle(identity: StoredIdentity, handle: string): Pr
   }
 
   const key = recordKey(handle);
-  const values: Uint8Array[] = [];
   try {
     for await (const ev of node.services.dht.get(key, { signal: AbortSignal.timeout(LOOKUP_TIMEOUT_MS) })) {
-      if (ev.name === "VALUE") values.push(ev.value);
+      if (ev.name !== "VALUE") continue;
+      // Re-verify locally: never trust a record just because a peer served it.
+      // The first record that passes is enough, so don't wait for the rest of
+      // the query (which can take many seconds asking unreachable peers).
+      const record = await validateRecord(key, ev.value).catch(() => null);
+      if (record) return { handle: record.handle, handleKey, peerId: record.peer_id };
     }
   } catch {
-    // "not found" or timeout; decide below based on what arrived
+    // "not found" or timeout
   }
-  if (values.length === 0) return null;
-
-  // Re-verify locally: never trust a record just because a peer served it.
-  const best = await selectRecord(key, values).catch(() => -1);
-  if (best < 0) return null;
-  const record = await validateRecord(key, values[best]);
-  return { handle: record.handle, handleKey, peerId: record.peer_id };
+  return null;
 }
 
 /** Stops the node (on logout). */
